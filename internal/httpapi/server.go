@@ -2,24 +2,36 @@ package httpapi
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
+	"time"
 
 	"opencode-router/internal/upstream"
+	"opencode-router/internal/usage"
 )
 
 const maxBodyBytes = 16 << 20
 
+//go:embed dashboard.html
+var dashboardHTML []byte
+
 type Server struct {
 	Client *upstream.Client
+	Usage  *usage.Store
 }
 
-func New(client *upstream.Client) *Server {
-	return &Server{Client: client}
+func New(client *upstream.Client, store *usage.Store) *Server {
+	if store == nil {
+		store = usage.Disabled()
+	}
+	return &Server{Client: client, Usage: store}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -30,7 +42,43 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("/v1/responses", s.handleResponses)
 	mux.HandleFunc("/v1/messages", s.handleMessages)
+	mux.HandleFunc("/v1/usage/stats", s.handleUsageStats)
+	mux.HandleFunc("/dashboard", s.handleDashboard)
+	mux.HandleFunc("/dashboard/usage", s.handleDashboard)
+	mux.HandleFunc("/", s.handleRoot)
 	return mux
+}
+
+func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	http.Redirect(w, r, "/dashboard", http.StatusFound)
+}
+
+func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(dashboardHTML)
+}
+
+func (s *Server) handleUsageStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		return
+	}
+	period := r.URL.Query().Get("period")
+	stats, err := s.Usage.Stats(period, time.Now())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -76,22 +124,27 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	stream, _ := body["stream"].(bool)
 	kind := upstream.KindFor(model)
 
+	rec := s.beginRecord(r, "chat", model, stream)
+	sw := &statusWriter{ResponseWriter: w}
+	defer rec.commit(sw)
+
 	switch kind {
 	case upstream.KindChat:
-		s.proxyChat(w, r, body, model, stream)
+		s.proxyChat(sw, r, body, model, stream, rec)
 	case upstream.KindResponses:
-		s.proxyChatToResponses(w, r, body, model, stream)
+		s.proxyChatToResponses(sw, r, body, model, stream, rec)
 	case upstream.KindMessages:
-		s.proxyChatToMessages(w, r, body, model, stream)
+		s.proxyChatToMessages(sw, r, body, model, stream, rec)
 	}
 }
 
-func (s *Server) proxyChat(w http.ResponseWriter, r *http.Request, body map[string]any, model string, stream bool) {
+func (s *Server) proxyChat(w http.ResponseWriter, r *http.Request, body map[string]any, model string, stream bool, rec *record) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
 	resp, rename, err := s.Client.Do(ctx, upstream.KindChat, model, body, s.callOptions(r, stream))
 	if err != nil {
+		rec.fail(err)
 		writeUpstreamError(w, err)
 		return
 	}
@@ -103,7 +156,8 @@ func (s *Server) proxyChat(w http.ResponseWriter, r *http.Request, body map[stri
 		flush()
 		idle := upstream.NewIdleReader(resp.Body, s.Client.StreamIdle, cancel)
 		defer idle.Stop()
-		if err := upstream.StreamPassthrough(idle, w, flush, rename); err != nil {
+		if err := upstream.StreamPassthrough(idle, w, flush, rename, rec.setUsage); err != nil {
+			rec.fail(err)
 			if idle.TimedOut() {
 				log.Printf("[chat] stream stalled for %s; cancelled", s.Client.StreamIdle)
 			} else {
@@ -115,13 +169,15 @@ func (s *Server) proxyChat(w http.ResponseWriter, r *http.Request, body map[stri
 
 	out, err := upstream.AggregateChatSSE(resp.Body, model)
 	if err != nil {
+		rec.fail(err)
 		writeUpstreamError(w, err)
 		return
 	}
+	rec.setUsageFrom(out["usage"])
 	writeJSON(w, http.StatusOK, out)
 }
 
-func (s *Server) proxyChatToResponses(w http.ResponseWriter, r *http.Request, body map[string]any, model string, stream bool) {
+func (s *Server) proxyChatToResponses(w http.ResponseWriter, r *http.Request, body map[string]any, model string, stream bool, rec *record) {
 	body["model"] = model
 	converted := upstream.ChatToResponses(body)
 
@@ -130,6 +186,7 @@ func (s *Server) proxyChatToResponses(w http.ResponseWriter, r *http.Request, bo
 
 	resp, rename, err := s.Client.Do(ctx, upstream.KindResponses, model, converted, s.callOptions(r, stream))
 	if err != nil {
+		rec.fail(err)
 		writeUpstreamError(w, err)
 		return
 	}
@@ -141,20 +198,26 @@ func (s *Server) proxyChatToResponses(w http.ResponseWriter, r *http.Request, bo
 		flush()
 		idle := upstream.NewIdleReader(resp.Body, s.Client.StreamIdle, cancel)
 		defer idle.Stop()
-		if err := upstream.StreamResponsesToChat(idle, w, flush, model, rename); err != nil && !idle.TimedOut() {
-			log.Printf("[responses->chat] stream error: %v", err)
+		if err := upstream.StreamResponsesToChat(idle, w, flush, model, rename, rec.setUsage); err != nil {
+			rec.fail(err)
+			if !idle.TimedOut() {
+				log.Printf("[responses->chat] stream error: %v", err)
+			}
 		}
 		return
 	}
 	out, err := upstream.AggregateResponsesSSE(resp.Body, model)
 	if err != nil {
+		rec.fail(err)
 		writeUpstreamError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, upstream.ResponsesToChat(out, model))
+	chat := upstream.ResponsesToChat(out, model)
+	rec.setUsageFrom(chat["usage"])
+	writeJSON(w, http.StatusOK, chat)
 }
 
-func (s *Server) proxyChatToMessages(w http.ResponseWriter, r *http.Request, body map[string]any, model string, stream bool) {
+func (s *Server) proxyChatToMessages(w http.ResponseWriter, r *http.Request, body map[string]any, model string, stream bool, rec *record) {
 	body["model"] = model
 	converted := upstream.ChatToAnthropic(body)
 
@@ -163,6 +226,7 @@ func (s *Server) proxyChatToMessages(w http.ResponseWriter, r *http.Request, bod
 
 	resp, rename, err := s.Client.Do(ctx, upstream.KindMessages, model, converted, s.callOptions(r, stream))
 	if err != nil {
+		rec.fail(err)
 		writeUpstreamError(w, err)
 		return
 	}
@@ -174,17 +238,23 @@ func (s *Server) proxyChatToMessages(w http.ResponseWriter, r *http.Request, bod
 		flush()
 		idle := upstream.NewIdleReader(resp.Body, s.Client.StreamIdle, cancel)
 		defer idle.Stop()
-		if err := upstream.StreamAnthropicToChat(idle, w, flush, model, rename); err != nil && !idle.TimedOut() {
-			log.Printf("[messages->chat] stream error: %v", err)
+		if err := upstream.StreamAnthropicToChat(idle, w, flush, model, rename, rec.setUsage); err != nil {
+			rec.fail(err)
+			if !idle.TimedOut() {
+				log.Printf("[messages->chat] stream error: %v", err)
+			}
 		}
 		return
 	}
 	out, err := upstream.AggregateAnthropicSSE(resp.Body, model)
 	if err != nil {
+		rec.fail(err)
 		writeUpstreamError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, upstream.AnthropicToChat(out, model))
+	chat := upstream.AnthropicToChat(out, model)
+	rec.setUsageFrom(chat["usage"])
+	writeJSON(w, http.StatusOK, chat)
 }
 
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
@@ -208,33 +278,43 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	stream, _ := body["stream"].(bool)
 
+	rec := s.beginRecord(r, "responses", model, stream)
+	sw := &statusWriter{ResponseWriter: w}
+	defer rec.commit(sw)
+
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
 	resp, rename, err := s.Client.Do(ctx, upstream.KindResponses, model, body, s.callOptions(r, stream))
 	if err != nil {
-		writeUpstreamError(w, err)
+		rec.fail(err)
+		writeUpstreamError(sw, err)
 		return
 	}
 	defer resp.Close()
 
 	if stream {
-		writeSSEHeaders(w)
-		flush := flusher(w)
+		writeSSEHeaders(sw)
+		flush := flusher(sw)
 		flush()
 		idle := upstream.NewIdleReader(resp.Body, s.Client.StreamIdle, cancel)
 		defer idle.Stop()
-		if err := upstream.StreamPassthrough(idle, w, flush, rename); err != nil && !idle.TimedOut() {
-			log.Printf("[responses] stream error: %v", err)
+		if err := upstream.StreamPassthrough(idle, sw, flush, rename, rec.setUsage); err != nil {
+			rec.fail(err)
+			if !idle.TimedOut() {
+				log.Printf("[responses] stream error: %v", err)
+			}
 		}
 		return
 	}
 	out, err := upstream.AggregateResponsesSSE(resp.Body, model)
 	if err != nil {
-		writeUpstreamError(w, err)
+		rec.fail(err)
+		writeUpstreamError(sw, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, out)
+	rec.setUsageFrom(out["usage"])
+	writeJSON(sw, http.StatusOK, out)
 }
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
@@ -258,33 +338,43 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	stream, _ := body["stream"].(bool)
 
+	rec := s.beginRecord(r, "messages", model, stream)
+	sw := &statusWriter{ResponseWriter: w}
+	defer rec.commit(sw)
+
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
 	resp, rename, err := s.Client.Do(ctx, upstream.KindMessages, model, body, s.callOptions(r, stream))
 	if err != nil {
-		writeUpstreamError(w, err)
+		rec.fail(err)
+		writeUpstreamError(sw, err)
 		return
 	}
 	defer resp.Close()
 
 	if stream {
-		writeSSEHeaders(w)
-		flush := flusher(w)
+		writeSSEHeaders(sw)
+		flush := flusher(sw)
 		flush()
 		idle := upstream.NewIdleReader(resp.Body, s.Client.StreamIdle, cancel)
 		defer idle.Stop()
-		if err := upstream.StreamPassthrough(idle, w, flush, rename); err != nil && !idle.TimedOut() {
-			log.Printf("[messages] stream error: %v", err)
+		if err := upstream.StreamPassthrough(idle, sw, flush, rename, rec.setUsage); err != nil {
+			rec.fail(err)
+			if !idle.TimedOut() {
+				log.Printf("[messages] stream error: %v", err)
+			}
 		}
 		return
 	}
 	out, err := upstream.AggregateAnthropicSSE(resp.Body, model)
 	if err != nil {
-		writeUpstreamError(w, err)
+		rec.fail(err)
+		writeUpstreamError(sw, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, out)
+	rec.setUsageFrom(out["usage"])
+	writeJSON(sw, http.StatusOK, out)
 }
 
 func (s *Server) callOptions(r *http.Request, stream bool) upstream.CallOptions {
@@ -362,4 +452,156 @@ func writeUpstreamError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusBadGateway, err.Error(), "upstream_error")
+}
+
+// statusWriter remembers the status code while staying transparent for SSE
+// flushing and ResponseController-based unwrapping.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if w.wrote {
+		return
+	}
+	w.wrote = true
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(p []byte) (int, error) {
+	if !w.wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+type record struct {
+	store      *usage.Store
+	ctx        context.Context
+	start      time.Time
+	model      string
+	endpoint   string
+	proxy      string
+	stream     bool
+	prompt     int
+	completion int
+	failure    error
+}
+
+func (s *Server) beginRecord(r *http.Request, endpoint, model string, stream bool) *record {
+	return &record{
+		store:    s.Usage,
+		ctx:      r.Context(),
+		start:    time.Now(),
+		model:    model,
+		endpoint: endpoint,
+		proxy:    sanitizeProxy(r.Header.Get("X-OCR-Proxy")),
+		stream:   stream,
+	}
+}
+
+func (rec *record) setUsage(prompt, completion int) {
+	if prompt > 0 || completion > 0 {
+		rec.prompt, rec.completion = prompt, completion
+	}
+}
+
+func (rec *record) setUsageFrom(raw any) {
+	u, ok := raw.(map[string]any)
+	if !ok {
+		return
+	}
+	prompt := int(numberOf(u["prompt_tokens"]))
+	completion := int(numberOf(u["completion_tokens"]))
+	if prompt == 0 {
+		prompt = int(numberOf(u["input_tokens"]))
+	}
+	if completion == 0 {
+		completion = int(numberOf(u["output_tokens"]))
+	}
+	rec.setUsage(prompt, completion)
+}
+
+func (rec *record) fail(err error) {
+	if err != nil && rec.failure == nil {
+		rec.failure = err
+	}
+}
+
+func (rec *record) commit(sw *statusWriter) {
+	if rec == nil || rec.store == nil {
+		return
+	}
+	status := "ok"
+	if rec.failure != nil || sw.status >= 400 {
+		status = "error"
+	}
+	if rec.ctx != nil && errors.Is(rec.ctx.Err(), context.Canceled) {
+		status = "canceled"
+	}
+	httpStatus := sw.status
+	if httpStatus == 0 {
+		httpStatus = http.StatusOK
+	}
+	errText := ""
+	if rec.failure != nil {
+		errText = rec.failure.Error()
+	}
+	rec.store.Record(usage.Entry{
+		Time:             rec.start,
+		Model:            rec.model,
+		Endpoint:         rec.endpoint,
+		Status:           status,
+		HTTPStatus:       httpStatus,
+		LatencyMs:        time.Since(rec.start).Milliseconds(),
+		PromptTokens:     rec.prompt,
+		CompletionTokens: rec.completion,
+		Stream:           rec.stream,
+		Proxy:            rec.proxy,
+		Error:            errText,
+	})
+}
+
+// sanitizeProxy keeps the proxy label useful without ever persisting
+// credentials embedded in a proxy URL.
+func sanitizeProxy(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "default"
+	}
+	if strings.Contains(raw, "@") {
+		if u, err := url.Parse(raw); err == nil && u.Host != "" {
+			u.User = nil
+			return u.String()
+		}
+		return "redacted"
+	}
+	return raw
+}
+
+func numberOf(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	case json.Number:
+		f, _ := n.Float64()
+		return f
+	default:
+		return 0
+	}
 }

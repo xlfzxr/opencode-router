@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>opencode-router · usage</title>
+<style>
+  :root {
+    --bg: #0a0d13;
+    --panel: #10151d;
+    --panel-2: #0c1118;
+    --line: #1d2634;
+    --line-soft: #161e2a;
+    --text: #e6edf3;
+    --muted: #8592a3;
+    --dim: #5b6776;
+    --green: #3fb950;
+    --blue: #58a6ff;
+    --red: #f85149;
+    --amber: #d29922;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background:
+      radial-gradient(900px 400px at 15% -10%, rgba(47, 129, 247, .10), transparent 60%),
+      radial-gradient(700px 300px at 90% 0%, rgba(63, 185, 80, .05), transparent 55%),
+      var(--bg);
+    color: var(--text);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+  }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .mono, .num { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+  .muted { color: var(--muted); }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+
+  .top {
+    position: sticky; top: 0; z-index: 20;
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 14px 22px;
+    background: rgba(10, 13, 19, .82);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .logo {
+    display: grid; place-items: center;
+    width: 36px; height: 36px; border-radius: 9px;
+    background: linear-gradient(135deg, #1f6feb, #3fb950);
+    color: #03140a; font: 700 12px/1 ui-monospace, monospace; letter-spacing: -.5px;
+    box-shadow: 0 0 0 1px rgba(255,255,255,.08) inset;
+  }
+  .brand h1 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: -.2px; }
+  .brand p { margin: 1px 0 0; font-size: 11.5px; color: var(--muted); }
+  .top-right { display: flex; align-items: center; gap: 16px; font-size: 12px; white-space: nowrap; }
+  .live { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+  .live i { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px rgba(63,185,80,.15); animation: pulse 2.4s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .45 } }
+  body.stale .live i { background: var(--red); box-shadow: 0 0 0 3px rgba(248,81,73,.15); animation: none; }
+
+  main { max-width: 1280px; margin: 0 auto; padding: 22px; }
+  .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 16px; }
+  .periods { display: inline-flex; gap: 2px; padding: 3px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; }
+  .periods button {
+    appearance: none; border: 0; background: transparent; color: var(--muted);
+    padding: 6px 12px; border-radius: 6px; font: 600 12px/1 inherit; cursor: pointer;
+  }
+  .periods button:hover { color: var(--text); }
+  .periods button.active { background: #1b2534; color: var(--text); box-shadow: 0 0 0 1px var(--line) inset; }
+  .updated { font-size: 12px; color: var(--muted); font-family: ui-monospace, monospace; }
+
+  .cards { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .card {
+    background: linear-gradient(180deg, rgba(255,255,255,.015), transparent), var(--panel);
+    border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 15px;
+    min-width: 0;
+  }
+  .card-label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .7px; color: var(--muted); }
+  .card strong { display: block; margin-top: 7px; font-size: 24px; line-height: 1.1; font-weight: 650; letter-spacing: -.4px; font-variant-numeric: tabular-nums; }
+  .card-sub { display: block; margin-top: 5px; font-size: 11.5px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card-sub.bad { color: var(--red); }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; min-width: 0; }
+  .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border-bottom: 1px solid var(--line-soft); }
+  .panel-head h2 { margin: 0; font-size: 12.5px; font-weight: 650; letter-spacing: .2px; }
+  .panel-head .sub { font-size: 11px; color: var(--dim); }
+  .legend { display: inline-flex; align-items: center; gap: 12px; font-size: 11px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .legend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+  .legend .in { background: var(--blue); }
+  .legend .out { background: var(--green); }
+
+  .chart-panel { margin-bottom: 14px; }
+  .chart { display: flex; align-items: flex-end; gap: 2px; height: 196px; padding: 16px 14px 8px; overflow: hidden; }
+  .chart .empty { margin: auto; color: var(--dim); font-size: 12.5px; }
+  .bar { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; }
+  .stack { width: 100%; max-width: 34px; height: 154px; display: flex; flex-direction: column-reverse; justify-content: flex-start; gap: 1px; border-radius: 3px 3px 0 0; }
+  .seg { width: 100%; border-radius: 2px; transition: filter .15s; }
+  .seg.in { background: linear-gradient(180deg, #58a6ff, #2f81f7); }
+  .seg.out { background: linear-gradient(180deg, #56d364, #2ea043); }
+  .bar:hover .seg { filter: brightness(1.25); }
+  .bar-label { margin-top: 6px; font: 10px/1 ui-monospace, monospace; color: var(--dim); white-space: nowrap; }
+  .bar-label.hide { visibility: hidden; }
+
+  .grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr); gap: 14px; }
+  .table-wrap { max-height: 372px; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th {
+    position: sticky; top: 0; z-index: 1;
+    background: var(--panel); color: var(--muted);
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: .5px; font-weight: 600;
+    text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+  }
+  th.num { text-align: right; }
+  td { padding: 7px 12px; border-bottom: 1px solid var(--line-soft); white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: rgba(255,255,255,.018); }
+  td.model { max-width: 190px; overflow: hidden; text-overflow: ellipsis; }
+  td.empty, .empty-row { color: var(--dim); text-align: center; padding: 26px 12px; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 10.5px; font-weight: 600; border: 1px solid var(--line); color: var(--muted); background: var(--panel-2); }
+  .pill { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; font-weight: 650; text-transform: uppercase; letter-spacing: .4px; }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .pill.ok { color: var(--green); }
+  .pill.error { color: var(--red); }
+  .pill.canceled { color: var(--amber); }
+  .err-count { color: var(--red); }
+  .err-count.zero { color: var(--dim); }
+
+  footer { max-width: 1280px; margin: 0 auto; padding: 4px 22px 26px; color: var(--dim); font-size: 11px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+
+  @media (max-width: 980px) {
+    .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid2 { grid-template-columns: minmax(0, 1fr); }
+    .card strong { font-size: 21px; }
+  }
+  @media (max-width: 560px) {
+    .top { padding: 12px 14px; }
+    main { padding: 14px; }
+    .top-right a { display: none; }
+    .cards { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .card { padding: 12px; }
+    .card strong { font-size: 19px; }
+    .chart { height: 172px; padding: 12px 8px 6px; }
+    .stack { height: 132px; }
+  }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="logo">ocr</span>
+    <div>
+      <h1>opencode-router</h1>
+      <p>free tier · upstream opencode.ai</p>
+    </div>
+  </div>
+  <div class="top-right">
+    <span class="live"><i></i>local</span>
+    <a href="/v1/models" target="_blank" rel="noreferrer">models</a>
+    <a href="/health" target="_blank" rel="noreferrer">health</a>
+  </div>
+</header>
+
+<main>
+  <div class="toolbar">
+    <div class="periods" id="periods" role="group" aria-label="Period"></div>
+    <div class="updated" id="updated">loading…</div>
+  </div>
+
+  <section class="cards" id="cards" aria-label="Summary"></section>
+
+  <section class="panel chart-panel">
+    <div class="panel-head">
+      <h2>Tokens over time</h2>
+      <div class="legend">
+        <span><i class="in"></i>prompt</span>
+        <span><i class="out"></i>completion</span>
+      </div>
+    </div>
+    <div class="chart" id="chart"></div>
+  </section>
+
+  <div class="grid2">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>By model</h2>
+        <span class="sub" id="model-sub"></span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th class="num">Req</th>
+              <th class="num">In</th>
+              <th class="num">Out</th>
+              <th class="num">Avg</th>
+              <th class="num">Err</th>
+            </tr>
+          </thead>
+          <tbody id="models"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Recent requests</h2>
+        <span class="sub" id="range"></span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th>API</th>
+              <th>Status</th>
+              <th class="num">In / Out</th>
+              <th class="num">Latency</th>
+              <th>Mode</th>
+              <th>Proxy</th>
+              <th class="num">Age</th>
+            </tr>
+          </thead>
+          <tbody id="recent"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer>
+  <span>Usage data stays on this machine · SQLite</span>
+  <span>auto-refresh 5s</span>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  var PERIODS = [
+    ["today", "Today"],
+    ["24h", "24h"],
+    ["7d", "7D"],
+    ["30d", "30D"],
+    ["60d", "60D"],
+    ["all", "All"]
+  ];
+
+  var $ = function (id) { return document.getElementById(id); };
+  var state = { period: "today" };
+
+  function esc(value) {
+    return String(value == null ? "" : value).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function num(value) {
+    var n = Number(value);
+    return new Intl.NumberFormat("en-US").format(isFinite(n) ? n : 0);
+  }
+
+  function compact(value) {
+    var n = Number(value) || 0;
+    if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "k";
+    return String(n);
+  }
+
+  function latency(value) {
+    var n = Number(value) || 0;
+    return n >= 1000 ? (n / 1000).toFixed(1) + "s" : Math.round(n) + "ms";
+  }
+
+  function pct(ok, total) {
+    return total ? (100 * ok / total).toFixed(1) + "%" : "—";
+  }
+
+  function ago(iso) {
+    var then = new Date(iso).getTime();
+    if (!isFinite(then)) return "—";
+    var diff = Math.max(0, (Date.now() - then) / 1000);
+    if (diff < 60) return Math.floor(diff) + "s";
+    if (diff < 3600) return Math.floor(diff / 60) + "m";
+    if (diff < 86400) return Math.floor(diff / 3600) + "h";
+    return Math.floor(diff / 86400) + "d";
+  }
+
+  function card(label, value, sub, bad) {
+    return '<div class="card"><span class="card-label">' + label + "</span><strong>" + value +
+      '</strong><span class="card-sub' + (bad ? " bad" : "") + '">' + sub + "</span></div>";
+  }
+
+  function shortHour(label) {
+    var m = /(\d{2}):(\d{2})$/.exec(label || "");
+    return m ? m[1] + ":" + m[2] : (label || "");
+  }
+
+  function shortDay(label) {
+    var parts = (label || "").split("-");
+    return parts.length === 3 ? parts[2] + "/" + parts[1] : (label || "");
+  }
+
+  function renderChart(data) {
+    var series = data.series || [];
+    var chart = $("chart");
+    if (!series.length) {
+      chart.innerHTML = '<div class="empty">No requests in this period.</div>';
+      return;
+    }
+    var max = 1;
+    series.forEach(function (p) {
+      var total = (Number(p.promptTokens) || 0) + (Number(p.completionTokens) || 0);
+      if (total > max) max = total;
+    });
+    var step = Math.ceil(series.length / 8);
+    chart.innerHTML = series.map(function (p, i) {
+      var pin = Number(p.promptTokens) || 0;
+      var pout = Number(p.completionTokens) || 0;
+      var hin = 150 * pin / max;
+      var hout = 150 * pout / max;
+      var label = data.bucket === "hour" ? shortHour(p.label) : shortDay(p.label);
+      var show = i === 0 || i === series.length - 1 || i % step === 0;
+      var title = p.label + ": " + num(pin) + " in / " + num(pout) + " out · " + num(p.requests) + " req";
+      return '<div class="bar" title="' + esc(title) + '">' +
+        '<div class="stack">' +
+          '<div class="seg in" style="height:' + hin.toFixed(1) + 'px"></div>' +
+          '<div class="seg out" style="height:' + hout.toFixed(1) + 'px"></div>' +
+        "</div>" +
+        '<span class="bar-label ' + (show ? "" : "hide") + '">' + esc(label) + "</span>" +
+      "</div>";
+    }).join("");
+  }
+
+  function renderModels(data) {
+    var rows = data.byModel || [];
+    $("model-sub").textContent = rows.length ? rows.length + " models" : "";
+    if (!rows.length) {
+      $("models").innerHTML = '<tr><td colspan="6" class="empty">No requests yet.</td></tr>';
+      return;
+    }
+    $("models").innerHTML = rows.map(function (m) {
+      return "<tr>" +
+        '<td class="mono model" title="' + esc(m.model) + '">' + esc(m.model || "unknown") + "</td>" +
+        '<td class="num">' + num(m.requests) + "</td>" +
+        '<td class="num">' + compact(m.promptTokens) + "</td>" +
+        '<td class="num">' + compact(m.completionTokens) + "</td>" +
+        '<td class="num muted">' + latency(m.avgLatencyMs) + "</td>" +
+        '<td class="num err-count ' + (m.errors ? "" : "zero") + '">' + num(m.errors) + "</td>" +
+      "</tr>";
+    }).join("");
+  }
+
+  function renderRecent(data) {
+    var rows = data.recent || [];
+    if (!rows.length) {
+      $("recent").innerHTML = '<tr><td colspan="8" class="empty">No requests yet.</td></tr>';
+      return;
+    }
+    $("recent").innerHTML = rows.map(function (r) {
+      return "<tr>" +
+        '<td class="mono model" title="' + esc(r.model) + '">' + esc(r.model || "unknown") + "</td>" +
+        '<td><span class="badge">' + esc(r.endpoint) + "</span></td>" +
+        '<td><span class="pill ' + esc(r.status) + '">' + esc(r.status) + "</span></td>" +
+        '<td class="num">' + compact(r.promptTokens) + " / " + compact(r.completionTokens) + "</td>" +
+        '<td class="num muted">' + latency(r.latencyMs) + "</td>" +
+        '<td class="muted">' + (r.stream ? "SSE" : "JSON") + "</td>" +
+        '<td class="mono muted">' + esc(r.proxy || "default") + "</td>" +
+        '<td class="num muted" title="' + esc(r.time) + '">' + ago(r.time) + "</td>" +
+      "</tr>";
+    }).join("");
+  }
+
+  function render(data) {
+    var t = data.totals || {};
+    $("cards").innerHTML = [
+      card("Requests", num(t.requests), num(t.streams) + " streaming"),
+      card("Success rate", t.requests ? pct(t.ok, t.requests) : "—", num(t.errors) + " errors", t.errors > 0),
+      card("Prompt tokens", compact(t.promptTokens), num(t.promptTokens)),
+      card("Completion tokens", compact(t.completionTokens), num(t.completionTokens)),
+      card("Avg latency", t.requests ? latency(t.avgLatencyMs) : "—", num(t.totalTokens) + " total tokens")
+    ].join("");
+    renderChart(data);
+    renderModels(data);
+    renderRecent(data);
+    var since = data.since ? new Date(data.since) : null;
+    $("range").textContent = !since || since.getFullYear() < 2000
+      ? "all time"
+      : "since " + since.toLocaleString();
+  }
+
+  function setPeriod(period) {
+    state.period = period;
+    if (location.hash.slice(1) !== period) {
+      history.replaceState(null, "", "#" + period);
+    }
+    Array.prototype.forEach.call($("periods").children, function (button) {
+      button.classList.toggle("active", button.dataset.period === period);
+    });
+    load();
+  }
+
+  function load() {
+    var period = state.period;
+    fetch("/v1/usage/stats?period=" + encodeURIComponent(period), { cache: "no-store" })
+      .then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (body) {
+          if (!res.ok) {
+            throw new Error((body.error && body.error.message) || res.statusText);
+          }
+          return body;
+        });
+      })
+      .then(function (data) {
+        if (period !== state.period) return;
+        render(data);
+        $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+        document.body.classList.remove("stale");
+      })
+      .catch(function (err) {
+        $("updated").textContent = "error: " + err.message;
+        document.body.classList.add("stale");
+      });
+  }
+
+  $("periods").innerHTML = PERIODS.map(function (pair) {
+    return '<button type="button" data-period="' + pair[0] + '">' + pair[1] + "</button>";
+  }).join("");
+
+  $("periods").addEventListener("click", function (event) {
+    var button = event.target.closest("button[data-period]");
+    if (button) setPeriod(button.dataset.period);
+  });
+
+  var fromHash = location.hash.slice(1);
+  if (PERIODS.some(function (pair) { return pair[0] === fromHash; })) {
+    state.period = fromHash;
+  }
+  setPeriod(state.period);
+  setInterval(function () {
+    if (!document.hidden) load();
+  }, 5000);
+})();
+</script>
+</body>
+</html>

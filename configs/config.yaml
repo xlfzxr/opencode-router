@@ -14,6 +14,12 @@ session:
   ttl: 2h
   max_entries: 1000
 
+# Local usage statistics and dashboard (http://127.0.0.1:3002/dashboard).
+usage:
+  enabled: true
+  path: ""            # default: ~/.local/state/opencode-router/usage.db
+  retention_days: 60  # 0 keeps all history
+
 # Egress proxy, mirroring 9router's proxyAwareFetch options.
 # Resolution order: per-request X-OCR-Proxy > connection_proxy_url > url
 # > pool (round-robin when enabled) > environment > direct.

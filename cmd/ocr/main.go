@@ -17,6 +17,7 @@ import (
 	"opencode-router/internal/egress"
 	"opencode-router/internal/httpapi"
 	"opencode-router/internal/upstream"
+	"opencode-router/internal/usage"
 )
 
 func main() {
@@ -40,9 +41,16 @@ func main() {
 		CatalogTTL:     cfg.Upstream.CatalogTTL.Value(),
 	}
 
+	usageStore, err := usage.Open(cfg.Usage.Path, cfg.Usage.Enabled, cfg.Usage.RetentionDays)
+	if err != nil {
+		log.Printf("[usage] disabled: %v", err)
+		usageStore = usage.Disabled()
+	}
+	defer usageStore.Close()
+
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr,
-		Handler:           httpapi.New(client).Handler(),
+		Handler:           httpapi.New(client, usageStore).Handler(),
 		ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout.Value(),
 		// No WriteTimeout: SSE streams must be allowed to run for minutes.
 	}
@@ -53,6 +61,11 @@ func main() {
 	go func() {
 		log.Printf("opencode-router listening on %s (upstream %s, proxy enabled=%v strict=%v)",
 			cfg.Server.Addr, client.BaseURL, cfg.Proxy.Enabled, cfg.Proxy.Strict)
+		dashboardAddr := cfg.Server.Addr
+		if strings.HasPrefix(dashboardAddr, ":") {
+			dashboardAddr = "127.0.0.1" + dashboardAddr
+		}
+		log.Printf("[usage] dashboard http://%s/dashboard (enabled=%v)", dashboardAddr, cfg.Usage.Enabled)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server: %v", err)
 		}

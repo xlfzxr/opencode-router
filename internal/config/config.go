@@ -65,6 +65,12 @@ type Config struct {
 		MaxEntries int      `yaml:"max_entries"`
 	} `yaml:"session"`
 
+	Usage struct {
+		Enabled       bool   `yaml:"enabled"`
+		Path          string `yaml:"path"`
+		RetentionDays int    `yaml:"retention_days"`
+	} `yaml:"usage"`
+
 	Proxy Proxy `yaml:"proxy"`
 }
 
@@ -80,6 +86,8 @@ func Load(path string) (*Config, error) {
 	cfg.Upstream.CatalogTTL = Duration(10 * time.Minute)
 	cfg.Session.TTL = Duration(2 * time.Hour)
 	cfg.Session.MaxEntries = 1000
+	cfg.Usage.Enabled = true
+	cfg.Usage.RetentionDays = 60
 	cfg.Proxy.UseEnv = true
 	cfg.Proxy.PoolMaxTransports = 20
 
@@ -101,6 +109,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Proxy.PoolMaxTransports <= 0 {
 		cfg.Proxy.PoolMaxTransports = 20
+	}
+	if cfg.Usage.RetentionDays < 0 {
+		cfg.Usage.RetentionDays = 0
 	}
 	return cfg, nil
 }

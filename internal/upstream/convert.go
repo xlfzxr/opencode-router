@@ -451,9 +451,37 @@ func writeDone(w io.Writer) {
 	fmt.Fprint(w, "data: [DONE]\n\n")
 }
 
+// reportUsage forwards token counts from a passthrough chunk that carries a
+// usage object. Chat Completions normally sends usage in a final chunk.
+func reportUsage(payload map[string]any, fn func(int, int)) {
+	if fn == nil {
+		return
+	}
+	u, ok := payload["usage"].(map[string]any)
+	if !ok {
+		return
+	}
+	p, c := usageNumbers(u)
+	if p > 0 || c > 0 {
+		fn(p, c)
+	}
+}
+
+func usageNumbers(u map[string]any) (int, int) {
+	prompt := int(numberOf(u["prompt_tokens"]))
+	completion := int(numberOf(u["completion_tokens"]))
+	if prompt == 0 {
+		prompt = int(numberOf(u["input_tokens"]))
+	}
+	if completion == 0 {
+		completion = int(numberOf(u["output_tokens"]))
+	}
+	return prompt, completion
+}
+
 // StreamPassthrough relays upstream SSE, restoring concealed tool names and
 // flushing after every event so tokens reach the client immediately.
-func StreamPassthrough(rd io.Reader, w io.Writer, flush func(), rename map[string]string) error {
+func StreamPassthrough(rd io.Reader, w io.Writer, flush func(), rename map[string]string, usageFn func(int, int)) error {
 	return ScanSSE(rd, func(ev sseEvent) error {
 		data := strings.TrimSpace(string(ev.Data))
 		if data == "" {
@@ -466,6 +494,9 @@ func StreamPassthrough(rd io.Reader, w io.Writer, flush func(), rename map[strin
 		}
 		var payload any
 		if json.Unmarshal([]byte(data), &payload) == nil {
+			if obj, ok := payload.(map[string]any); ok {
+				reportUsage(obj, usageFn)
+			}
 			payload = RestoreToolNames(payload, rename)
 			encoded, err := json.Marshal(payload)
 			if err == nil {
@@ -487,7 +518,7 @@ func StreamPassthrough(rd io.Reader, w io.Writer, flush func(), rename map[strin
 
 // StreamResponsesToChat translates Responses SSE events into Chat Completions
 // chunks so an OpenAI client can consume a muse-spark stream.
-func StreamResponsesToChat(rd io.Reader, w io.Writer, flush func(), model string, rename map[string]string) error {
+func StreamResponsesToChat(rd io.Reader, w io.Writer, flush func(), model string, rename map[string]string, usageFn func(int, int)) error {
 	id := "chatcmpl-" + randomBase62(24)
 	toolIndex := -1
 	finish := "stop"
@@ -570,6 +601,9 @@ func StreamResponsesToChat(rd io.Reader, w io.Writer, flush func(), model string
 	if len(usage) > 0 {
 		in := int(numberOf(usage["input_tokens"]))
 		outTokens := int(numberOf(usage["output_tokens"]))
+		if usageFn != nil && (in > 0 || outTokens > 0) {
+			usageFn(in, outTokens)
+		}
 		final["usage"] = map[string]any{
 			"prompt_tokens":     in,
 			"completion_tokens": outTokens,
@@ -586,7 +620,7 @@ func StreamResponsesToChat(rd io.Reader, w io.Writer, flush func(), model string
 
 // StreamAnthropicToChat translates Messages SSE events into Chat Completions
 // chunks for union-alpha.
-func StreamAnthropicToChat(rd io.Reader, w io.Writer, flush func(), model string, rename map[string]string) error {
+func StreamAnthropicToChat(rd io.Reader, w io.Writer, flush func(), model string, rename map[string]string, usageFn func(int, int)) error {
 	id := "chatcmpl-" + randomBase62(24)
 	toolIndex := -1
 	finish := "stop"
@@ -694,6 +728,9 @@ func StreamAnthropicToChat(rd io.Reader, w io.Writer, flush func(), model string
 	if len(usage) > 0 {
 		outTokens := int(numberOf(usage["output_tokens"]))
 		in := int(numberOf(usage["input_tokens"]))
+		if usageFn != nil && (in > 0 || outTokens > 0) {
+			usageFn(in, outTokens)
+		}
 		final["usage"] = map[string]any{
 			"prompt_tokens":     in,
 			"completion_tokens": outTokens,
