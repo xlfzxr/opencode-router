@@ -209,9 +209,15 @@ func AggregateChatSSE(rd io.Reader, model string) (map[string]any, error) {
 	}
 	finish := agg.finish
 	if finish == "" {
-		if len(agg.order) > 0 {
+		switch {
+		case len(agg.order) > 0:
 			finish = "tool_calls"
-		} else {
+		case agg.content.Len() == 0 && agg.reasoning.Len() == 0:
+			// The upstream stream ended without a finish reason and without any
+			// usable content: report "incomplete" so combo fallback can retry
+			// another model instead of masking an empty response as a stop.
+			finish = "incomplete"
+		default:
 			finish = "stop"
 		}
 	}

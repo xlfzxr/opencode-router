@@ -16,6 +16,7 @@ import (
 	"opencode-router/internal/config"
 	"opencode-router/internal/egress"
 	"opencode-router/internal/httpapi"
+	"opencode-router/internal/routing"
 	"opencode-router/internal/upstream"
 	"opencode-router/internal/usage"
 )
@@ -48,9 +49,21 @@ func main() {
 	}
 	defer usageStore.Close()
 
+	router := routing.New(routing.Config{
+		Enabled:     cfg.Routing.Enabled,
+		Alias:       cfg.Routing.Alias,
+		Strategy:    cfg.Routing.Strategy,
+		StickyLimit: cfg.Routing.StickyLimit,
+		AutoSwitch:  cfg.Routing.AutoSwitch,
+		MaxAttempts: cfg.Routing.MaxAttempts,
+		Candidates:  cfg.Routing.Candidates,
+	})
+	log.Printf("[routing] alias %q enabled=%v strategy=%s auto_switch=%v max_attempts=%d",
+		router.Alias(), cfg.Routing.Enabled, cfg.Routing.Strategy, cfg.Routing.AutoSwitch, cfg.Routing.MaxAttempts)
+
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr,
-		Handler:           httpapi.New(client, usageStore).Handler(),
+		Handler:           httpapi.New(client, usageStore, router).Handler(),
 		ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout.Value(),
 		// No WriteTimeout: SSE streams must be allowed to run for minutes.
 	}

@@ -71,6 +71,19 @@ type Config struct {
 		RetentionDays int    `yaml:"retention_days"`
 	} `yaml:"usage"`
 
+	// Routing backs the public single-model alias ("ocr") with a pool of real
+	// upstream models, 9router combo style: capability auto-switch, fallback /
+	// round-robin ordering, and failure cooldowns.
+	Routing struct {
+		Enabled     bool     `yaml:"enabled"`
+		Alias       string   `yaml:"alias"`
+		Strategy    string   `yaml:"strategy"`
+		StickyLimit int      `yaml:"sticky_limit"`
+		AutoSwitch  bool     `yaml:"auto_switch"`
+		MaxAttempts int      `yaml:"max_attempts"`
+		Candidates  []string `yaml:"candidates"`
+	} `yaml:"routing"`
+
 	Proxy Proxy `yaml:"proxy"`
 }
 
@@ -88,6 +101,12 @@ func Load(path string) (*Config, error) {
 	cfg.Session.MaxEntries = 1000
 	cfg.Usage.Enabled = true
 	cfg.Usage.RetentionDays = 60
+	cfg.Routing.Enabled = true
+	cfg.Routing.Alias = "ocr"
+	cfg.Routing.Strategy = "fallback"
+	cfg.Routing.StickyLimit = 1
+	cfg.Routing.AutoSwitch = true
+	cfg.Routing.MaxAttempts = 3
 	cfg.Proxy.UseEnv = true
 	cfg.Proxy.PoolMaxTransports = 20
 
@@ -112,6 +131,18 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Usage.RetentionDays < 0 {
 		cfg.Usage.RetentionDays = 0
+	}
+	if cfg.Routing.Alias == "" {
+		cfg.Routing.Alias = "ocr"
+	}
+	if cfg.Routing.Strategy != "round-robin" {
+		cfg.Routing.Strategy = "fallback"
+	}
+	if cfg.Routing.StickyLimit <= 0 {
+		cfg.Routing.StickyLimit = 1
+	}
+	if cfg.Routing.MaxAttempts < 0 {
+		cfg.Routing.MaxAttempts = 0
 	}
 	return cfg, nil
 }
