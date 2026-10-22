@@ -1,0 +1,30 @@
+server:
+  addr: "127.0.0.1:3002"
+  read_header_timeout: 10s
+  shutdown_timeout: 10s
+
+upstream:
+  base_url: "https://opencode.ai"
+  header_timeout: 30s
+  request_timeout: 120s
+  stream_idle_timeout: 25s
+  catalog_ttl: 10m
+
+session:
+  ttl: 2h
+  max_entries: 1000
+
+# Egress proxy, mirroring 9router's proxyAwareFetch options.
+# Resolution order: per-request X-OCR-Proxy > connection_proxy_url > url
+# > pool (round-robin when enabled) > environment > direct.
+proxy:
+  enabled: false
+  strict: false
+  url: ""
+  connection_proxy_url: ""
+  no_proxy: ""
+  use_env: true
+  pool_max_transports: 20
+  pool:
+    - id: tor
+      url: "socks5://127.0.0.1:9050"

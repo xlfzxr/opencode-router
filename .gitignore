@@ -1,0 +1,4 @@
+/ocr
+*.log
+.env
+.DS_Store
