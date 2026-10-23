@@ -53,6 +53,8 @@ type Config struct {
 	} `yaml:"server"`
 
 	Upstream struct {
+		CatalogURL        string   `yaml:"catalog_url"`
+		CatalogProvider   string   `yaml:"catalog_provider"`
 		BaseURL           string   `yaml:"base_url"`
 		HeaderTimeout     Duration `yaml:"header_timeout"`
 		RequestTimeout    Duration `yaml:"request_timeout"`
@@ -92,6 +94,8 @@ func Load(path string) (*Config, error) {
 	cfg.Server.Addr = "127.0.0.1:3002"
 	cfg.Server.ReadHeaderTimeout = Duration(10 * time.Second)
 	cfg.Server.ShutdownTimeout = Duration(10 * time.Second)
+	cfg.Upstream.CatalogURL = "https://models.dev/api.json"
+	cfg.Upstream.CatalogProvider = "opencode"
 	cfg.Upstream.BaseURL = "https://opencode.ai"
 	cfg.Upstream.HeaderTimeout = Duration(30 * time.Second)
 	cfg.Upstream.RequestTimeout = Duration(120 * time.Second)
@@ -107,7 +111,10 @@ func Load(path string) (*Config, error) {
 	cfg.Routing.StickyLimit = 1
 	cfg.Routing.AutoSwitch = true
 	cfg.Routing.MaxAttempts = 3
-	cfg.Proxy.UseEnv = true
+	cfg.Proxy.Enabled = true
+	cfg.Proxy.Strict = true
+	cfg.Proxy.URL = "socks5h://127.0.0.1:9050"
+	cfg.Proxy.UseEnv = false
 	cfg.Proxy.PoolMaxTransports = 20
 
 	if path == "" {

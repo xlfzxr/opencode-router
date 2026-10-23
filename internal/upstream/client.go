@@ -23,12 +23,14 @@ const (
 )
 
 type Client struct {
-	BaseURL        string
-	Egress         *egress.Manager
-	Sessions       *SessionStore
-	RequestTimeout time.Duration
-	StreamIdle     time.Duration
-	CatalogTTL     time.Duration
+	CatalogURL      string
+	CatalogProvider string
+	BaseURL         string
+	Egress          *egress.Manager
+	Sessions        *SessionStore
+	RequestTimeout  time.Duration
+	StreamIdle      time.Duration
+	CatalogTTL      time.Duration
 
 	catalogMu sync.Mutex
 	catalogAt time.Time
@@ -375,11 +377,11 @@ func (c *Client) ListModels(ctx context.Context, opts CallOptions) ([]Model, err
 
 	sel, err := c.Egress.Select(c.BaseURL, opts.Proxy, opts.Circuit)
 	if err != nil {
-		return FallbackCatalog(), err
+		return nil, err
 	}
 	transport, err := c.Egress.Transport(sel)
 	if err != nil {
-		return FallbackCatalog(), err
+		return nil, err
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, c.RequestTimeout)
 	defer cancel()
@@ -387,36 +389,43 @@ func (c *Client) ListModels(ctx context.Context, opts CallOptions) ([]Model, err
 	session := c.Sessions.Resolve(nil, opts.Header, opts.SessionPin, "")
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, c.BaseURL+"/inference/v1/models", nil)
 	if err != nil {
-		return FallbackCatalog(), err
+		return nil, err
 	}
 	setHeaders(req, session, KindChat, false)
 
 	resp, err := (&http.Client{Transport: transport}).Do(req)
 	if err != nil {
-		return FallbackCatalog(), err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return FallbackCatalog(), err
+		return nil, err
 	}
 	if resp.StatusCode >= 400 {
-		return FallbackCatalog(), parseUpstreamError(resp.StatusCode, data, resp.Header)
+		return nil, parseUpstreamError(resp.StatusCode, data, resp.Header)
 	}
 	models := ParseCatalog(data)
 	if len(models) == 0 {
-		return FallbackCatalog(), fmt.Errorf("empty upstream catalog")
+		return nil, fmt.Errorf("empty upstream catalog")
 	}
-	filtered := models[:0]
-	for _, model := range models {
-		if IsFreeModel(model.ID) {
-			filtered = append(filtered, model)
+	metadata, err := c.modelsDev(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	live := map[string]bool{}
+	for _, m := range models {
+		live[m.ID] = true
+	}
+	filtered := []Model{}
+	for _, m := range metadata {
+		if live[m.ID] {
+			filtered = append(filtered, m)
 		}
 	}
 	if len(filtered) == 0 {
-		filtered = FallbackCatalog()
+		return nil, fmt.Errorf("no free models shared by models.dev and upstream catalog")
 	}
-
 	c.catalogMu.Lock()
 	c.catalog = append([]Model(nil), filtered...)
 	c.catalogAt = time.Now()

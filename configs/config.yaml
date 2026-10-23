@@ -4,6 +4,8 @@ server:
   shutdown_timeout: 10s
 
 upstream:
+  catalog_url: "https://models.dev/api.json"
+  catalog_provider: "opencode"
   base_url: "https://opencode.ai"
   header_timeout: 30s
   request_timeout: 120s
@@ -31,28 +33,18 @@ routing:
   sticky_limit: 1        # requests per model before round-robin advances
   auto_switch: true      # float vision/pdf/audio/video-capable models to front
   max_attempts: 3        # max candidate models tried per request (0 = all)
-  candidates:            # ordered pool; empty = built-in defaults
-    - glm-5.3-flash-free
-    - deepseek-v4.1-flash-free
-    - minimax-m3.1-flash-free
-    - nemotron-3.5-lightning-free
-    - mimo-v2.6-flash-free
-    - jev-1.13-free
-    - nemotron-3.5-super-vl-free
-    - flint-40b-free
-    - beam-free
-    - big-pickle
+  candidates: []        # discover all live free OpenCode models dynamically
 
 # Egress proxy, mirroring 9router's proxyAwareFetch options.
 # Resolution order: per-request X-OCR-Proxy > connection_proxy_url > url
 # > pool (round-robin when enabled) > environment > direct.
 proxy:
-  enabled: false
-  strict: false
-  url: ""
+  enabled: true
+  strict: true
+  url: "socks5h://127.0.0.1:9050"
   connection_proxy_url: ""
   no_proxy: ""
-  use_env: true
+  use_env: false
   pool_max_transports: 20
   pool:
     - id: tor

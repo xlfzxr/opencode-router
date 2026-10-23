@@ -28,21 +28,6 @@ const (
 	StrategyRoundRobin Strategy = "round-robin"
 )
 
-// DefaultCandidates is the pool used when the config defines none, ordered by
-// general strength on the OpenCode free tier.
-var DefaultCandidates = []string{
-	"glm-5.3-flash-free",
-	"deepseek-v4.1-flash-free",
-	"minimax-m3.1-flash-free",
-	"nemotron-3.5-lightning-free",
-	"mimo-v2.6-flash-free",
-	"jev-1.13-free",
-	"nemotron-3.5-super-vl-free",
-	"flint-40b-free",
-	"beam-free",
-	"big-pickle",
-}
-
 // Cooldowns mirror 9router's config/errorConfig.js.
 const (
 	cooldownLong         = 2 * time.Minute
@@ -73,9 +58,7 @@ func (c Config) withDefaults() Config {
 	if c.StickyLimit <= 0 {
 		c.StickyLimit = 1
 	}
-	if len(c.Candidates) == 0 {
-		c.Candidates = append([]string(nil), DefaultCandidates...)
-	}
+
 	return c
 }
 
@@ -135,8 +118,10 @@ func (r *Router) Plan(body map[string]any, available []string) []string {
 
 	candidates := append([]string(nil), r.cfg.Candidates...)
 	if len(available) > 0 {
-		if filtered := intersect(candidates, available); len(filtered) > 0 {
-			candidates = filtered
+		if len(candidates) == 0 {
+			candidates = append([]string(nil), available...)
+		} else {
+			candidates = intersect(candidates, available)
 		}
 	}
 	if len(candidates) == 0 {

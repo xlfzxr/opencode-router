@@ -44,8 +44,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/v1/models", s.handleModels)
-	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
-	mux.HandleFunc("/v1/responses", s.handleResponses)
 	mux.HandleFunc("/v1/messages", s.handleMessages)
 	mux.HandleFunc("/v1/usage/stats", s.handleUsageStats)
 	mux.HandleFunc("/dashboard", s.handleDashboard)
@@ -97,18 +95,22 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	models, err := s.Client.ListModels(r.Context(), s.callOptions(r, false))
 	if err != nil {
-		w.Header().Set("X-OCR-Catalog", "fallback")
-		log.Printf("[models] upstream catalog failed: %v", err)
+		writeError(w, 503, "model catalog unavailable", "api_error")
+		return
 	}
-	data := make([]any, 0, len(models))
+	data := make([]any, 0, len(models)+1)
+	if s.Router.Enabled() {
+		data = append(data, map[string]any{"id": s.Router.Alias(), "type": "model", "display_name": "Auto free model", "created_at": "1970-01-01T00:00:00Z"})
+	}
 	for _, model := range models {
 		data = append(data, map[string]any{
-			"id":       model.ID,
-			"object":   "model",
-			"owned_by": model.OwnedBy,
+			"id":           model.ID,
+			"type":         "model",
+			"display_name": model.ID,
+			"created_at":   "1970-01-01T00:00:00Z",
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+	writeJSON(w, http.StatusOK, map[string]any{"has_more": false, "data": data})
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -135,10 +137,23 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		plan = s.routedPlan(r, body, model)
-	case s.Router.Enabled():
-		plan = []string{s.Router.StripAlias(model)}
 	default:
-		plan = []string{strings.TrimSpace(model)}
+		candidate := s.Router.StripAlias(model)
+		catalog, err := s.Client.ListModels(r.Context(), s.callOptions(r, false))
+		if err != nil {
+			writeError(w, 503, "model catalog unavailable", "api_error")
+			return
+		}
+		for _, m := range catalog {
+			if m.ID == candidate {
+				plan = []string{candidate}
+				break
+			}
+		}
+		if len(plan) == 0 {
+			writeError(w, 400, "model is not in the live free OpenCode catalog", "invalid_request_error")
+			return
+		}
 	}
 	if len(plan) == 0 {
 		writeError(w, http.StatusServiceUnavailable, "no candidate models available for "+model, "routing_error")
@@ -149,7 +164,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stream, _ := body["stream"].(bool)
-	rec := s.beginRecord(r, "chat", plan[0], stream)
+	rec := s.beginRecord(r, "messages", plan[0], stream)
 	sw := &statusWriter{ResponseWriter: w}
 	defer rec.commit(sw)
 
@@ -200,7 +215,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 func (s *Server) routedPlan(r *http.Request, body map[string]any, alias string) []string {
 	models, err := s.Client.ListModels(r.Context(), s.callOptions(r, false))
 	if err != nil {
-		log.Printf("[routing] catalog unavailable (%v); using fallback catalog", err)
+		log.Printf("[routing] catalog unavailable: %v", err)
+		return nil
 	}
 	available := make([]string, 0, len(models))
 	for _, model := range models {
@@ -387,136 +403,6 @@ func (s *Server) attemptChatToMessages(w http.ResponseWriter, r *http.Request, b
 
 // (conversion attempts live above as attemptChatToResponses / attemptChatToMessages)
 
-func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
-		return
-	}
-	body, err := decodeBody(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
-		return
-	}
-	model, _ := body["model"].(string)
-	if model == "" {
-		writeError(w, http.StatusBadRequest, "model is required", "invalid_request_error")
-		return
-	}
-	if s.Router.IsAlias(model) {
-		writeError(w, http.StatusBadRequest, "model "+model+" is a chat alias; use /v1/chat/completions", "invalid_request_error")
-		return
-	}
-	model = s.Router.StripAlias(model)
-	if kind := upstream.KindFor(model); kind != upstream.KindResponses {
-		writeError(w, http.StatusBadRequest, "model "+model+" is not served by the responses endpoint; use /v1/chat/completions", "invalid_request_error")
-		return
-	}
-	stream, _ := body["stream"].(bool)
-
-	rec := s.beginRecord(r, "responses", model, stream)
-	sw := &statusWriter{ResponseWriter: w}
-	defer rec.commit(sw)
-
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-
-	resp, rename, err := s.Client.Do(ctx, upstream.KindResponses, model, body, s.callOptions(r, stream))
-	if err != nil {
-		rec.fail(err)
-		writeUpstreamError(sw, err)
-		return
-	}
-	defer resp.Close()
-
-	if stream {
-		writeSSEHeaders(sw)
-		flush := flusher(sw)
-		flush()
-		idle := upstream.NewIdleReader(resp.Body, s.Client.StreamIdle, cancel)
-		defer idle.Stop()
-		if err := upstream.StreamPassthrough(idle, sw, flush, rename, rec.setUsage); err != nil {
-			rec.fail(err)
-			if !idle.TimedOut() {
-				log.Printf("[responses] stream error: %v", err)
-			}
-		}
-		return
-	}
-	out, err := upstream.AggregateResponsesSSE(resp.Body, model)
-	if err != nil {
-		rec.fail(err)
-		writeUpstreamError(sw, err)
-		return
-	}
-	rec.setUsageFrom(out["usage"])
-	writeJSON(sw, http.StatusOK, out)
-}
-
-func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
-		return
-	}
-	body, err := decodeBody(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
-		return
-	}
-	model, _ := body["model"].(string)
-	if model == "" {
-		writeError(w, http.StatusBadRequest, "model is required", "invalid_request_error")
-		return
-	}
-	if s.Router.IsAlias(model) {
-		writeError(w, http.StatusBadRequest, "model "+model+" is a chat alias; use /v1/chat/completions", "invalid_request_error")
-		return
-	}
-	model = s.Router.StripAlias(model)
-	if kind := upstream.KindFor(model); kind != upstream.KindMessages {
-		writeError(w, http.StatusBadRequest, "model "+model+" is not served by the messages endpoint; use /v1/chat/completions", "invalid_request_error")
-		return
-	}
-	stream, _ := body["stream"].(bool)
-
-	rec := s.beginRecord(r, "messages", model, stream)
-	sw := &statusWriter{ResponseWriter: w}
-	defer rec.commit(sw)
-
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-
-	resp, rename, err := s.Client.Do(ctx, upstream.KindMessages, model, body, s.callOptions(r, stream))
-	if err != nil {
-		rec.fail(err)
-		writeUpstreamError(sw, err)
-		return
-	}
-	defer resp.Close()
-
-	if stream {
-		writeSSEHeaders(sw)
-		flush := flusher(sw)
-		flush()
-		idle := upstream.NewIdleReader(resp.Body, s.Client.StreamIdle, cancel)
-		defer idle.Stop()
-		if err := upstream.StreamPassthrough(idle, sw, flush, rename, rec.setUsage); err != nil {
-			rec.fail(err)
-			if !idle.TimedOut() {
-				log.Printf("[messages] stream error: %v", err)
-			}
-		}
-		return
-	}
-	out, err := upstream.AggregateAnthropicSSE(resp.Body, model)
-	if err != nil {
-		rec.fail(err)
-		writeUpstreamError(sw, err)
-		return
-	}
-	rec.setUsageFrom(out["usage"])
-	writeJSON(sw, http.StatusOK, out)
-}
-
 func (s *Server) callOptions(r *http.Request, stream bool) upstream.CallOptions {
 	return upstream.CallOptions{
 		Proxy:      r.Header.Get("X-OCR-Proxy"),
@@ -571,6 +457,7 @@ func writeError(w http.ResponseWriter, status int, message, kind string) {
 		kind = "invalid_request_error"
 	}
 	writeJSON(w, status, map[string]any{
+		"type": "error",
 		"error": map[string]any{
 			"message": message,
 			"type":    kind,

@@ -71,21 +71,6 @@ type Model struct {
 	OwnedBy string `json:"owned_by"`
 }
 
-// fallbackModels is used when the upstream catalog is unreachable. Mirrors the
-// free-tier members the router is expected to expose.
-var fallbackModels = []string{
-	"deepseek-v4.1-flash-free",
-	"glm-5.3-flash-free",
-	"nemotron-3.5-super-vl-free",
-	"mimo-v2.6-flash-free",
-	"minimax-m3.1-flash-free",
-	"longcat-2.5-preview-free",
-	"jev-1.13-free",
-	"nemotron-3.5-lightning-free",
-	"beam-free",
-	"big-pickle",
-}
-
 func ParseCatalog(data []byte) []Model {
 	var payload map[string]any
 	if err := json.Unmarshal(data, &payload); err != nil {
@@ -119,24 +104,6 @@ func ParseCatalog(data []byte) []Model {
 				}
 			}
 		}
-	}
-	return out
-}
-
-func IsFreeModel(id string) bool {
-	lower := strings.ToLower(strings.TrimSpace(id))
-	if lower == "" {
-		return false
-	}
-	// The catalog also advertises paid muse-spark ids (401 without a key) and
-	// union-alpha (currently unavailable). Only truly free ids are exposed.
-	return strings.Contains(lower, "free") || lower == "big-pickle" || strings.HasPrefix(lower, "beam-")
-}
-
-func FallbackCatalog() []Model {
-	out := make([]Model, 0, len(fallbackModels))
-	for _, id := range fallbackModels {
-		out = append(out, Model{ID: id, Object: "model", OwnedBy: "opencode"})
 	}
 	return out
 }

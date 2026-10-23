@@ -102,10 +102,10 @@ func TestPlanAvailabilityFilter(t *testing.T) {
 		t.Fatalf("availability filter wrong: %v", plan)
 	}
 
-	// No intersection at all: keep the configured pool rather than dropping it.
+	// No intersection: never send requests to models absent from the catalog.
 	plan = r.Plan(map[string]any{}, []string{"zzz"})
-	if len(plan) != 3 {
-		t.Fatalf("expected unfiltered pool, got %v", plan)
+	if len(plan) != 0 {
+		t.Fatalf("expected empty pool, got %v", plan)
 	}
 }
 
@@ -237,5 +237,16 @@ func TestRateLimitBackoffGrows(t *testing.T) {
 	}
 	if second < 3900*time.Millisecond || second > 4100*time.Millisecond {
 		t.Fatalf("second backoff = %v, want ~4s", second)
+	}
+}
+
+func TestDynamicCandidates(t *testing.T) {
+	r := New(Config{Enabled: true})
+	plan := r.Plan(map[string]any{}, []string{"brand-new-free", "another-free"})
+	if len(plan) != 2 || plan[0] != "brand-new-free" || plan[1] != "another-free" {
+		t.Fatalf("did not discover new models: %v", plan)
+	}
+	if empty := r.Plan(map[string]any{}, nil); len(empty) != 0 {
+		t.Fatalf("unexpected hardcoded fallback: %v", empty)
 	}
 }
