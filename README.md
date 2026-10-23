@@ -1,112 +1,181 @@
-# opencode-router
+# OpenCode Claude-format bridge (Termux)
 
-## Service background di Termux
+Bridge khusus **Anthropic Messages** untuk OpenCode v1. Ini bukan API Claude
+resmi: model dijalankan oleh upstream OpenCode, bukan otomatis model Claude.
+Tidak ada lagi endpoint publik Chat Completions/Responses atau supervisor
+Node.js. Adapter wire internal masih diperlukan untuk model upstream yang
+berbicara format Chat Completions/Responses.
 
-Service memakai Node.js `child_process` untuk menjalankan binary Go sebagai
-child dari supervisor background. Tidak membutuhkan systemd, root, atau npm
-package tambahan.
+```text
+OpenCode v1 → POST /v1/messages → Go bridge
+                                 ├─ katalog models.dev/api.json (via Tor)
+                                 ├─ intersect katalog inference OpenCode
+                                 ├─ urutkan model gratis + fallback/cooldown
+                                 └─ inference opencode.ai (via Tor)
+```
+
+## Instalasi Termux
+
+Jika sebelumnya memakai service Node dari versi lama, **jalankan `service stop`
+sebelum memperbarui checkout**. Jangan jalankan `start-router` lama bersamaan.
+
+Dari folder repo yang sudah diperbarui:
 
 ```sh
-pkg update
-pkg install golang nodejs-lts
+pkg install golang tor
 cd ~/opencode-router
 bash scripts/install-termux-service.sh
-
+bash scripts/tor-up.sh
 service start
 service status
-service logs    # 100 baris terakhir + live; Ctrl+C hanya menutup penampil log
-service stop
+```
+
+Installer membangun binary `ocr` dan memasang launcher `$PREFIX/bin/service`.
+Node.js, npm, SQLite, root, dan systemd tidak dibutuhkan. Build pertama masih
+mengunduh modul YAML. Command `service` milik program lain tidak ditimpa.
+
+```sh
+service start       # Go re-exec + setsid, background tanpa terminal
+service stop        # SIGTERM + graceful shutdown, tunggu maksimal 35 detik
 service restart
+service status
+service logs        # tail -n 100 -f; Ctrl+C hanya menutup penampil log
+service foreground  # server langsung di terminal; Ctrl+C menghentikannya
 ```
 
-Installer membangun `./ocr` dan memasang command `$PREFIX/bin/service`. Jika
-command `service` lain sudah ada, installer menolak menimpanya. Jalankan langsung
-`node scripts/service.cjs start` (atau stop/status/restart/logs) bila ingin tetap
-menggunakan service manager lain.
+Hentikan background dengan `service stop` sebelum memakai foreground pada port
+yang sama. Tanpa launcher: `./ocr start -config ./configs/config.yaml` atau
+`./ocr foreground -config ./configs/config.yaml`.
 
-- Default konfigurasi: `configs/config.yaml`. Dashboard default:
-  `http://127.0.0.1:3002/dashboard`.
-- Command dapat digunakan dari direktori mana pun. Jangan memindahkan atau
-  menghapus repo setelah instalasi; jalankan ulang installer jika dipindahkan.
-- Log/PID: `~/.local/state/opencode-router/service/`. Log di-append, belum ada
-  rotasi otomatis.
-- `start` tidak menduplikasi proses. `stop` mengirim SIGTERM ke supervisor, yang
-  meneruskannya ke router untuk graceful shutdown; setelah 30 detik child yang
-  belum selesai akan diberi SIGKILL. Sesuaikan timeout ini di script jika
-  `server.shutdown_timeout` disetel lebih lama dari 30 detik.
-- Error startup langsung (misalnya config salah atau port terpakai) dilaporkan;
-  status start berarti proses berhasil diluncurkan, **bukan** readiness HTTP atau
-  kesiapan upstream/proxy. Periksa log untuk detail.
-- Service tidak otomatis restart saat router crash, tidak otomatis hidup setelah
-  reboot, dan tidak mengelola Tor. Tor opsional dapat dijalankan terpisah lewat
-  `bash scripts/tor-up.sh`.
-- Proses tetap berjalan setelah command selesai/terminal ditutup, tetapi Android
-  tetap bisa membunuh Termux. Untuk penggunaan lama, jalankan `termux-wake-lock`
-  (jika tersedia) dan nonaktifkan optimasi baterai untuk Termux. Wake lock tidak
-  menjamin kebal terhadap Android task killer. Lepaskan dengan
-  `termux-wake-unlock` ketika tidak diperlukan.
+Start sukses berarti socket HTTP berhasil di-bind; **bukan** jaminan Tor sudah
+bootstrap atau upstream dapat diakses. Error startup masuk ke log. PID memakai
+identitas start-time `/proc` untuk mencegah salah menghentikan PID yang dipakai
+ulang. Controller dikunci agar start/restart bersamaan tidak menduplikasi proses.
 
-Override opsional (gunakan nilai yang sama untuk setiap command):
+Tor dikelola terpisah lewat `scripts/tor-up.sh`, bukan dihentikan saat bridge
+stop. Default proxy `socks5h://127.0.0.1:9050`, strict, tanpa fallback direct jika
+proxy gagal. Jangan ubah konfigurasi proxy jika ingin seluruh koneksi bridge
+melalui Tor. Endpoint hanya listen loopback secara default; tidak ada autentikasi
+API lokal. Jangan mengeksposnya ke internet.
 
-```sh
-export OCR_CONFIG="$HOME/router-config.yaml"  # sebaiknya path absolut
-export OCR_SERVICE_DIR="$HOME/.router-service"
-# export OCR_BINARY="/absolute/path/to/ocr"
-service start
+## OpenCode v1
+
+Gabungkan bagian ini ke konfigurasi OpenCode kamu (jangan menimpa konfigurasi lain):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "ocr": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "Local Claude-format bridge",
+      "options": {
+        "baseURL": "http://127.0.0.1:3002/v1",
+        "apiKey": "local-bridge"
+      },
+      "models": {
+        "ocr": {
+          "name": "Auto free OpenCode model",
+          "limit": { "context": 32768, "output": 4096 }
+        }
+      }
+    }
+  },
+  "model": "ocr/ocr"
+}
 ```
 
-Setelah update kode, jalankan ulang installer lalu `service restart` agar memakai
-binary terbaru. Untuk uninstall, `service stop`, lalu hapus
-`$PREFIX/bin/service` hanya jika itu launcher dari repo ini. Config, database
-usage, dan log tidak dihapus oleh installer.
+`local-bridge` hanya placeholder SDK, **bukan** API key Claude. Limit di contoh
+adalah batas konservatif client, bukan jaminan kapasitas semua model. Sesuaikan
+jika model yang dipilih memiliki limit lebih kecil.
 
-## Tes service controller
+Mendukung teks, gambar, tool use/result, tool choice, respons JSON, serta SSE
+Anthropic (message/content-block start/delta/stop). Konten document/audio dan
+server-side Anthropic tools belum didukung; konten yang tidak dikenal ditolak,
+bukan diam-diam dihapus. Blok thinking/signature dari riwayat tidak diteruskan
+karena tidak portabel antar-model. Bukan implementasi penuh API Anthropic
+(count_tokens, prompt caching, extended thinking tidak dijanjikan).
 
-```sh
-node --test scripts/service.test.cjs
-```
+## Katalog dan fallback
 
-Tes memakai child process dummy; tidak memerlukan Go, Termux, atau upstream.
+- `models.dev/api.json` adalah **metadata**, bukan endpoint inference.
+- Hanya provider `opencode` dengan harga input **dan** output eksplisit `0` yang
+  dipilih, lalu di-intersect dengan `/inference/v1/models` dari upstream.
+- TTL katalog default 10 menit; refresh saat ada request setelah TTL habis.
+  Tidak ada jaminan selalu paling baru atau bebas kuota/rate limit.
+- Tidak ada daftar fallback model hardcoded. Jika katalog tidak tersedia atau
+  tidak ada irisan, request gagal dengan error, bukan mencoba model berbayar.
+- `routing.candidates: []` memakai semua model hasil discovery, diurutkan ID
+  sebelum capability ordering/cooldown. Isi candidates untuk preferensi manual;
+  model yang tidak ada di katalog tetap tidak dipakai.
+- Alias `ocr` memakai fallback sesuai `max_attempts` (default 3). Model ID
+  langsung hanya diterima jika ada di katalog gratis. Setelah SSE dikirim,
+  bridge tidak berpindah model di tengah respons.
 
-## Storage statistik JSON (tanpa SQLite)
+Endpoint publik:
 
-Statistik dashboard disimpan di
-`~/.local/state/opencode-router/usage.json`. Build tidak lagi membutuhkan
-`modernc.org/sqlite`, CGO, atau paket database tambahan. Modul YAML tetap perlu
-tersedia/download pada build pertama. Penyimpanan JSON ditujukan untuk satu
-instance router dan pemakaian pribadi, bukan riwayat besar jutaan request.
+- `POST /v1/messages`
+- `GET /v1/models` (termasuk alias)
+- `GET /health` atau `/healthz` (liveness, bukan kesiapan upstream)
+- `GET /dashboard` dan `/v1/usage/stats`
 
-- `usage.path` di config memilih lokasi file JSON. Environment `OCR_USAGE_PATH`
-  mengganti lokasi default; `OCR_USAGE_DB` lama tetap diterima sebagai fallback.
-  Config `usage.path` yang terisi mengalahkan environment.
-- File ditulis atomik dengan temporary file + fsync + rename, permission `0600`,
-  dan exclusive advisory lock. Dua instance tidak boleh menulis path yang sama.
-- Request masuk antrean nonblocking, disimpan maksimal setiap sekitar satu
-  detik saat disk normal, dan di-flush saat graceful shutdown. Force-kill/crash
-  dapat menghilangkan request yang belum tersimpan. Antrean penuh dapat
-  menjatuhkan statistik, tetapi tidak menghambat respons router.
-- `usage.retention_days` tetap berlaku (default 60 hari). Nilai `0` menyimpan
-  seluruh riwayat. Snapshot dimuat ke memori dan ditulis ulang saat berubah;
-  batasi retensi untuk menghemat memori/storage pada HP.
-- File SQLite lama **tidak dimigrasikan, dihapus, atau ditimpa**. Default baru
-  memakai `usage.json`, sehingga statistik mulai dari kosong. Bila config masih
-  menunjuk file SQLite lama, ubah `usage.path` ke path JSON baru atau kosongkan
-  agar memakai default. File rusak/format tidak didukung akan ditolak; router
-  mencatat error dan menonaktifkan statistik untuk sesi itu, bukan merusak file.
+`/v1/chat/completions` dan `/v1/responses` sudah dihapus (404).
 
-Sesudah mengambil versi kode ini, build ulang dan restart:
+## Data dan proses
 
-```sh
-cd ~/opencode-router
-unset OCR_CONFIG OCR_SERVICE_DIR OCR_BINARY
-bash scripts/install-termux-service.sh && service restart
-```
+- Statistik JSON: `~/.local/state/opencode-router/usage.json`; dapat diubah lewat
+  `usage.path` atau `OCR_USAGE_PATH`. File SQLite lama tidak dimigrasikan/ditimpa.
+- Snapshot ditulis atomik (temp + fsync + rename) setiap sekitar satu detik ketika
+  berubah, di-flush saat shutdown, dengan advisory lock dan permission `0600`.
+  Crash/force-kill dapat kehilangan statistik yang belum tersimpan. Antrean penuh
+  menjatuhkan statistik agar tidak menghambat SSE.
+- Retensi default 60 hari. Seluruh snapshot dimuat ke memori; untuk penggunaan
+  pribadi, bukan jutaan request. Nilai `retention_days: 0` menyimpan semua data.
+- Log dan state service: `~/.local/state/opencode-router/service/`; override
+  `OCR_SERVICE_DIR` harus konsisten untuk semua command. Belum ada rotasi log.
+- `setsid` tidak kebal Android task killer. Nonaktifkan optimasi baterai Termux;
+  gunakan `termux-wake-lock` jika tersedia. Tidak ada auto-restart/auto-boot.
+- Jika config shutdown lebih lama dari 35 detik, controller stop dapat timeout
+  tanpa memaksa SIGKILL; periksa log/proses sebelum menjalankan ulang.
 
-Jangan jalankan launcher lama `start-router` bersama service baru. Jika launcher
-lama sedang berjalan, hentikan dulu memakai `stop-router`.
+Setelah update kode, jalankan ulang installer lalu `service restart`.
 
-Tes Go (termasuk persistensi JSON, retensi, lock, dan concurrency):
+## Tes
 
 ```sh
 go test -race ./...
+go vet ./...
 ```
+
+Tes menggunakan upstream dan katalog dummy; tidak membutuhkan Tor atau inference
+live. Pengujian kompatibilitas langsung di Android/OpenCode tetap diperlukan.
+
+## Uji respons setiap model gratis dengan curl
+
+Setelah Tor dan bridge berjalan:
+
+```sh
+pkg install curl jq
+bash scripts/test-free-models.sh
+```
+
+Script mengambil ID aktual dari `/v1/models`, melewati alias `ocr`, lalu mengirim
+request Messages non-streaming satu per satu. HTTP 200 dengan teks tidak kosong
+berarti `ok`; respons kosong, error, dan timeout dicatat terpisah. Tes ini tidak
+menguji streaming, tool use, atau akurasi jawaban. Karena memakai ID langsung,
+fallback ke model lain tidak menyembunyikan kegagalan model yang diuji.
+
+Output disimpan ke `~/opencode-model-tests/<timestamp>-<pid>/`: katalog, request,
+respons, stderr curl, dan `results.jsonl`. Exit code 1 berarti ada probe gagal;
+periksa error sebelum menyimpulkan model tidak tersedia (429/Tor/upstream bisa
+bersifat sementara). Semua model diuji berurutan dengan jeda 2 detik dan timeout
+90 detik per model agar tidak membanjiri upstream.
+
+Override opsional:
+
+```sh
+OCR_PROBE_TIMEOUT=180 OCR_PROBE_DELAY=5 bash scripts/test-free-models.sh
+```
+
+Jika alias diubah di config, set `OCR_ALIAS` dengan nilai yang sama. Jika port
+bridge diubah, gunakan `OCR_BASE_URL=http://127.0.0.1:PORT` (tanpa `/v1`).

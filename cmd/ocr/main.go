@@ -17,11 +17,22 @@ import (
 	"opencode-router/internal/egress"
 	"opencode-router/internal/httpapi"
 	"opencode-router/internal/routing"
+	"opencode-router/internal/service"
 	"opencode-router/internal/upstream"
 	"opencode-router/internal/usage"
 )
 
 func main() {
+	if handled, err := service.Run(os.Args[1:]); handled {
+		if err != nil {
+			log.Print(err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "foreground" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+	}
 	configPath := flag.String("config", "configs/config.yaml", "path to config file")
 	flag.Parse()
 
@@ -34,12 +45,14 @@ func main() {
 	warnProxyUnreachable(cfg.Proxy)
 
 	client := &upstream.Client{
-		BaseURL:        strings.TrimRight(cfg.Upstream.BaseURL, "/"),
-		Egress:         proxyMgr,
-		Sessions:       upstream.NewSessionStore(cfg.Session.TTL.Value(), cfg.Session.MaxEntries),
-		RequestTimeout: cfg.Upstream.RequestTimeout.Value(),
-		StreamIdle:     cfg.Upstream.StreamIdleTimeout.Value(),
-		CatalogTTL:     cfg.Upstream.CatalogTTL.Value(),
+		CatalogURL:      cfg.Upstream.CatalogURL,
+		CatalogProvider: cfg.Upstream.CatalogProvider,
+		BaseURL:         strings.TrimRight(cfg.Upstream.BaseURL, "/"),
+		Egress:          proxyMgr,
+		Sessions:        upstream.NewSessionStore(cfg.Session.TTL.Value(), cfg.Session.MaxEntries),
+		RequestTimeout:  cfg.Upstream.RequestTimeout.Value(),
+		StreamIdle:      cfg.Upstream.StreamIdleTimeout.Value(),
+		CatalogTTL:      cfg.Upstream.CatalogTTL.Value(),
 	}
 
 	usageStore, err := usage.Open(cfg.Usage.Path, cfg.Usage.Enabled, cfg.Usage.RetentionDays)
@@ -71,6 +84,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	listener, err := net.Listen("tcp", cfg.Server.Addr)
+	if err != nil {
+		log.Fatalf("listen: %v", err)
+	}
+	service.Ready()
 	go func() {
 		log.Printf("opencode-router listening on %s (upstream %s, proxy enabled=%v strict=%v)",
 			cfg.Server.Addr, client.BaseURL, cfg.Proxy.Enabled, cfg.Proxy.Strict)
@@ -79,7 +97,7 @@ func main() {
 			dashboardAddr = "127.0.0.1" + dashboardAddr
 		}
 		log.Printf("[usage] dashboard http://%s/dashboard (enabled=%v)", dashboardAddr, cfg.Usage.Enabled)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("server: %v", err)
 		}
 	}()

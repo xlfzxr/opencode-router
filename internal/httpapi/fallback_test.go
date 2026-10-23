@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -25,6 +26,8 @@ func fakeUpstream(t *testing.T) *httptest.Server {
 	}
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/catalog":
+			fmt.Fprint(w, `{"opencode":{"models":{"bad-free":{"cost":{"input":0,"output":0}},"badreq-free":{"cost":{"input":0,"output":0}},"empty-free":{"cost":{"input":0,"output":0}},"good-free":{"cost":{"input":0,"output":0}}}}}`)
 		case "/inference/v1/models":
 			writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": []any{
 				map[string]any{"id": "bad-free", "object": "model", "owned_by": "opencode"},
@@ -65,6 +68,7 @@ func testServer(t *testing.T, baseURL string, candidates []string) *httptest.Ser
 	t.Helper()
 	client := &upstream.Client{
 		BaseURL:        baseURL,
+		CatalogURL:     baseURL + "/catalog",
 		Egress:         egress.New(config.Proxy{}, 5*time.Second),
 		Sessions:       upstream.NewSessionStore(time.Hour, 100),
 		RequestTimeout: 10 * time.Second,
@@ -85,7 +89,7 @@ func testServer(t *testing.T, baseURL string, candidates []string) *httptest.Ser
 func postChat(t *testing.T, url, model string) (*http.Response, map[string]any) {
 	t.Helper()
 	payload := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}],"max_tokens":8}`, model)
-	resp, err := http.Post(url+"/v1/chat/completions", "application/json", strings.NewReader(payload))
+	resp, err := http.Post(url+"/v1/messages", "application/json", strings.NewReader(payload))
 	if err != nil {
 		t.Fatalf("POST failed: %v", err)
 	}
@@ -129,9 +133,9 @@ func TestFallbackOnZeroContent(t *testing.T) {
 	if got := resp.Header.Get("X-OCR-Model"); got != "good-free" {
 		t.Fatalf("X-OCR-Model = %q, want good-free", got)
 	}
-	choices, _ := out["choices"].([]any)
-	if len(choices) == 0 {
-		t.Fatalf("no choices in %v", out)
+	content, _ := out["content"].([]any)
+	if len(content) == 0 {
+		t.Fatalf("no content in %v", out)
 	}
 }
 
@@ -181,7 +185,58 @@ func TestAliasRejectedOnResponsesEndpoint(t *testing.T) {
 		t.Fatalf("POST failed: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 400 for alias on /v1/responses, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for removed /v1/responses, got %d", resp.StatusCode)
+	}
+}
+
+func TestMessagesStreamingFallback(t *testing.T) {
+	up := fakeUpstream(t)
+	defer up.Close()
+	srv := testServer(t, up.URL, []string{"bad-free", "good-free"})
+	defer srv.Close()
+	resp, err := http.Post(srv.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"ocr","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 || resp.Header.Get("X-OCR-Model") != "good-free" {
+		t.Fatalf("status=%d headers=%v body=%s", resp.StatusCode, resp.Header, raw)
+	}
+	for _, want := range []string{"event: message_start", "text_delta", "event: message_stop", `"input_tokens":5`, `"output_tokens":1`} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("missing %s: %s", want, raw)
+		}
+	}
+	if strings.Contains(string(raw), "chat.completion") {
+		t.Fatalf("leaked Chat format: %s", raw)
+	}
+}
+func TestLegacyEndpointsRemovedAndPaidRejected(t *testing.T) {
+	up := fakeUpstream(t)
+	defer up.Close()
+	srv := testServer(t, up.URL, nil)
+	defer srv.Close()
+	for _, endpoint := range []string{"/v1/chat/completions", "/v1/responses"} {
+		resp, err := http.Post(srv.URL+endpoint, "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 404 {
+			t.Fatalf("legacy %s: %d", endpoint, resp.StatusCode)
+		}
+	}
+	resp, _ := postChat(t, srv.URL, "paid-model")
+	if resp.StatusCode != 400 {
+		t.Fatalf("unlisted model accepted: %d", resp.StatusCode)
+	}
+	resp, out := postChat(t, srv.URL, "ocr")
+	if resp.StatusCode != 400 || resp.Header.Get("X-OCR-Model") != "badreq-free" {
+		t.Fatalf("dynamic plan must stop at the discovered request-scoped error: %d %+v", resp.StatusCode, out)
 	}
 }

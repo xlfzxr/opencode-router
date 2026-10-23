@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 : "${PREFIX:?Jalankan installer ini di Termux (PREFIX belum tersedia).}"
-command -v node >/dev/null || { echo 'Install Node.js: pkg install nodejs-lts' >&2; exit 1; }
 command -v go >/dev/null || { echo 'Install Go: pkg install golang' >&2; exit 1; }
 
 # Do not overwrite an unrelated system/service manager command.
@@ -27,7 +26,7 @@ mv -f "$TMP" "$ROOT/ocr"
 {
   printf '#!%s/bin/bash\n' "$PREFIX"
   printf '# opencode-router-service\n'
-  printf 'exec %q %q "$@"\n' "$(command -v node)" "$ROOT/scripts/service.cjs"
+  printf 'exec %q "${1:-status}" -config %q "${@:2}"\n' "$ROOT/ocr" "$ROOT/configs/config.yaml"
 } > "$DEST"
 chmod 700 "$DEST"
-echo 'Terpasang! Gunakan: service start | stop | restart | status | logs'
+echo 'Terpasang! Gunakan: service start | stop | restart | status | logs | foreground'
