@@ -1,181 +1,129 @@
-# OpenCode Claude-format bridge (Termux)
+# torctl
 
-Bridge khusus **Anthropic Messages** untuk OpenCode v1. Ini bukan API Claude
-resmi: model dijalankan oleh upstream OpenCode, bukan otomatis model Claude.
-Tidak ada lagi endpoint publik Chat Completions/Responses atau supervisor
-Node.js. Adapter wire internal masih diperlukan untuk model upstream yang
-berbicara format Chat Completions/Responses.
+Supervisor tunggal untuk Tor + Snowflake + HTTP bridge — **satu binary Go,
+satu perintah**. Tidak ada shell script, tidak ada `pkill` manual.
 
-```text
-OpenCode v1 → POST /v1/messages → Go bridge
-                                 ├─ katalog models.dev/api.json (via Tor)
-                                 ├─ intersect katalog inference OpenCode
-                                 ├─ urutkan model gratis + fallback/cooldown
-                                 └─ inference opencode.ai (via Tor)
+```
+torctl start    → nyalakan snowflake, nyalakan Tor (child), tunggu bootstrap
+                  100%, nyalakan HTTP bridge (foreground)
+torctl stop     → matikan bridge → Tor → snowflake, bersihkan state
+torctl status   → PID, port, IP keluar Tor
+torctl logs     → tail log tor + bridge + snowflake
+torctl restart  → stop + start
 ```
 
-## Instalasi Termux
+Semua proses dikelola sebagai **child process dari torctl** (bukan daemon
+terpisah), sehingga:
 
-Jika sebelumnya memakai service Node dari versi lama, **jalankan `service stop`
-sebelum memperbarui checkout**. Jangan jalankan `start-router` lama bersamaan.
+* kalau `torctl` mati → semua ikut mati (rapi, no orphan) — setiap child
+  dibunuh otomatis lewat `Pdeathsig`, plus deteksi anak yatim saat `start`;
+* state disimpan di `$PREFIX/var/run/torctl/`;
+* log disimpan di `$PREFIX/var/log/torctl/`.
 
-Dari folder repo yang sudah diperbarui:
+Di Termux, `PREFIX=/data/data/com.termux/files/usr` sehingga lokasinya:
 
-```sh
-pkg install golang tor
-cd ~/opencode-router
-bash scripts/install-termux-service.sh
-bash scripts/tor-up.sh
-service start
-service status
+```
+$PREFIX/var/run/torctl/    torctl.pid, tor.pid, snowflake.pid, torctl.torrc
+$PREFIX/var/log/torctl/    tor.log, bridge.log, snowflake.log
+$PREFIX/var/lib/torctl/    DataDirectory tor (bertahan antar restart)
 ```
 
-Installer membangun binary `ocr` dan memasang launcher `$PREFIX/bin/service`.
-Node.js, npm, SQLite, root, dan systemd tidak dibutuhkan. Build pertama masih
-mengunduh modul YAML. Command `service` milik program lain tidak ditimpa.
+Tanpa `PREFIX` (Linux desktop), prefix jatuh ke `~/.torctl/` dengan layout
+`run/`, `log/`, `lib/`.
 
-```sh
-service start       # Go re-exec + setsid, background tanpa terminal
-service stop        # SIGTERM + graceful shutdown, tunggu maksimal 35 detik
-service restart
-service status
-service logs        # tail -n 100 -f; Ctrl+C hanya menutup penampil log
-service foreground  # server langsung di terminal; Ctrl+C menghentikannya
+## Build
+
+```bash
+go build -o torctl .
+# Termux: pkg install golang && go build -o torctl .
+# tanpa flag -ldflags apa pun — tidak ada dependensi/linkname khusus
 ```
 
-Hentikan background dengan `service stop` sebelum memakai foreground pada port
-yang sama. Tanpa launcher: `./ocr start -config ./configs/config.yaml` atau
-`./ocr foreground -config ./configs/config.yaml`.
+Tidak ada dependensi eksternal — `go.mod` murni stdlib (dialer SOCKS5
+ditulis sendiri di `bridge.go`).
 
-Start sukses berarti socket HTTP berhasil di-bind; **bukan** jaminan Tor sudah
-bootstrap atau upstream dapat diakses. Error startup masuk ke log. PID memakai
-identitas start-time `/proc` untuk mencegah salah menghentikan PID yang dipakai
-ulang. Controller dikunci agar start/restart bersamaan tidak menduplikasi proses.
+## Pakai
 
-Tor dikelola terpisah lewat `scripts/tor-up.sh`, bukan dihentikan saat bridge
-stop. Default proxy `socks5h://127.0.0.1:9050`, strict, tanpa fallback direct jika
-proxy gagal. Jangan ubah konfigurasi proxy jika ingin seluruh koneksi bridge
-melalui Tor. Endpoint hanya listen loopback secara default; tidak ada autentikasi
-API lokal. Jangan mengeksposnya ke internet.
+```bash
+./torctl start          # sesi 1: biarkan jalan
+                        # → tor started (pid ...), waiting bootstrap...
+                        # → tor bootstrapped 100%
+                        # → bridge listening on 127.0.0.1:8118 -> 127.0.0.1:9050
 
-## OpenCode v1
-
-Gabungkan bagian ini ke konfigurasi OpenCode kamu (jangan menimpa konfigurasi lain):
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "ocr": {
-      "npm": "@ai-sdk/anthropic",
-      "name": "Local Claude-format bridge",
-      "options": {
-        "baseURL": "http://127.0.0.1:3002/v1",
-        "apiKey": "local-bridge"
-      },
-      "models": {
-        "ocr": {
-          "name": "Auto free OpenCode model",
-          "limit": { "context": 32768, "output": 4096 }
-        }
-      }
-    }
-  },
-  "model": "ocr/ocr"
-}
+./torctl status         # sesi 2
+./torctl logs           # tail tor.log + bridge.log + snowflake.log
+./torctl logs -f -n 50  # follow, 50 baris
+curl -x http://127.0.0.1:8118 -s https://check.torproject.org/api/ip
+./torctl stop           # bridge → tor → snowflake, state dibersihkan
 ```
 
-`local-bridge` hanya placeholder SDK, **bukan** API key Claude. Limit di contoh
-adalah batas konservatif client, bukan jaminan kapasitas semua model. Sesuaikan
-jika model yang dipilih memiliki limit lebih kecil.
+## Desain
 
-Mendukung teks, gambar, tool use/result, tool choice, respons JSON, serta SSE
-Anthropic (message/content-block start/delta/stop). Konten document/audio dan
-server-side Anthropic tools belum didukung; konten yang tidak dikenal ditolak,
-bukan diam-diam dihapus. Blok thinking/signature dari riwayat tidak diteruskan
-karena tidak portabel antar-model. Bukan implementasi penuh API Anthropic
-(count_tokens, prompt caching, extended thinking tidak dijanjikan).
+* **tor** dijalankan child process (`Setpgid` + `Pdeathsig=SIGKILL`),
+  stdout/stderr diarahkan ke `tor.log`; start menunggu
+  `Bootstrapped 100%` (maks. `TORCTL_BOOTSTRAP_TIMEOUT`, default 180s).
+* **snowflake** juga child process torctl — dijalankan dengan environment
+  protokol Managed Transport (`TOR_PT_MANAGED_TRANSPORT_VER=1`,
+  `TOR_PT_CLIENT_TRANSPORTS=snowflake`), lalu alamat SOCKS lokalnya dibaca
+  dari baris `CMETHOD snowflake SOCKS5 127.0.0.1:PORT` di stdout.
+  Tor memakai bentuk **eksternal**:
 
-## Katalog dan fallback
+  ```
+  UseBridges 1
+  ClientTransportPlugin snowflake socks5 127.0.0.1:PORT
+  Bridge snowflake 192.0.2.3:1 2 B8DA951F1B4652FB6945D394F2D6487AB75B2668
+  ```
 
-- `models.dev/api.json` adalah **metadata**, bukan endpoint inference.
-- Hanya provider `opencode` dengan harga input **dan** output eksplisit `0` yang
-  dipilih, lalu di-intersect dengan `/inference/v1/models` dari upstream.
-- TTL katalog default 10 menit; refresh saat ada request setelah TTL habis.
-  Tidak ada jaminan selalu paling baru atau bebas kuota/rate limit.
-- Tidak ada daftar fallback model hardcoded. Jika katalog tidak tersedia atau
-  tidak ada irisan, request gagal dengan error, bukan mencoba model berbayar.
-- `routing.candidates: []` memakai semua model hasil discovery, diurutkan ID
-  sebelum capability ordering/cooldown. Isi candidates untuk preferensi manual;
-  model yang tidak ada di katalog tetap tidak dipakai.
-- Alias `ocr` memakai fallback sesuai `max_attempts` (default 3). Model ID
-  langsung hanya diterima jika ada di katalog gratis. Setelah SSE dikirim,
-  bridge tidak berpindah model di tengah respons.
+  (dua bentuk `ClientTransportPlugin` — `exec` dan `socks4|socks5` —
+  didokumentasikan resmi di manpage tor; torctl memakai `socks5` supaya
+  snowflake tetap child torctl, bukan child tor.)
+* **bridge HTTP ↔ SOCKS5** berjalan di dalam proses torctl (by design):
+  `CONNECT` (HTTPS) dan plain-HTTP dua-duanya dial lewat SOCKS5 tor.
+  `torctl stop` mengirim SIGTERM ke supervisor; supervisor menutup bridge
+  lebih dulu, baru mematikan tor, lalu snowflake.
+* **torrc digenerate ulang** di `run/torctl.torrc` setiap start — torrc
+  milik sistem/tidak disentuh.
 
-Endpoint publik:
+## Konfigurasi (environment)
 
-- `POST /v1/messages`
-- `GET /v1/models` (termasuk alias)
-- `GET /health` atau `/healthz` (liveness, bukan kesiapan upstream)
-- `GET /dashboard` dan `/v1/usage/stats`
+| Variabel | Default | Keterangan |
+|---|---|---|
+| `TORCTL_SNOWFLAKE` | `1` | `0` = matikan snowflake (plain Tor / bridge custom) |
+| `TORCTL_BRIDGES` | line snowflake bawaan | bridge custom, dipisah `;` atau newline; hanya transport `snowflake` (atau `ip:port` polos) yang dikelola torctl |
+| `TORCTL_SOCKS_ADDR` | `127.0.0.1:9050` | SOCKS5 tor |
+| `TORCTL_BRIDGE_ADDR` | `127.0.0.1:8118` | HTTP bridge |
+| `TORCTL_TOR_BIN` | `tor` | binary tor |
+| `TORCTL_SNOWFLAKE_BIN` | `snowflake-client` | binary snowflake |
+| `TORCTL_SNOWFLAKE_URL` | broker resmi Tor Project | URL broker |
+| `TORCTL_SNOWFLAKE_FRONTS` | (kosong) | front domain (dipisah koma) untuk domain fronting |
+| `TORCTL_SNOWFLAKE_ICE` | STUN list | daftar STUN |
+| `TORCTL_BOOTSTRAP_TIMEOUT` | `180s` | batas tunggu bootstrap |
+| `TORCTL_EXTRA_TORRC` | — | path torrc tambahan (`Include`) |
+| `TORCTL_PREFIX` / `PREFIX` | Termux: `$PREFIX`, selain itu `~/.torctl` | prefix state/log |
+| `TORCTL_CHECK_URL` | `https://check.torproject.org/api/ip` | dipakai `status` |
 
-`/v1/chat/completions` dan `/v1/responses` sudah dihapus (404).
+Contoh:
 
-## Data dan proses
+```bash
+# plain Tor tanpa snowflake (mis. jaringan terbuka)
+TORCTL_SNOWFLAKE=0 ./torctl start
 
-- Statistik JSON: `~/.local/state/opencode-router/usage.json`; dapat diubah lewat
-  `usage.path` atau `OCR_USAGE_PATH`. File SQLite lama tidak dimigrasikan/ditimpa.
-- Snapshot ditulis atomik (temp + fsync + rename) setiap sekitar satu detik ketika
-  berubah, di-flush saat shutdown, dengan advisory lock dan permission `0600`.
-  Crash/force-kill dapat kehilangan statistik yang belum tersimpan. Antrean penuh
-  menjatuhkan statistik agar tidak menghambat SSE.
-- Retensi default 60 hari. Seluruh snapshot dimuat ke memori; untuk penggunaan
-  pribadi, bukan jutaan request. Nilai `retention_days: 0` menyimpan semua data.
-- Log dan state service: `~/.local/state/opencode-router/service/`; override
-  `OCR_SERVICE_DIR` harus konsisten untuk semua command. Belum ada rotasi log.
-- `setsid` tidak kebal Android task killer. Nonaktifkan optimasi baterai Termux;
-  gunakan `termux-wake-lock` jika tersedia. Tidak ada auto-restart/auto-boot.
-- Jika config shutdown lebih lama dari 35 detik, controller stop dapat timeout
-  tanpa memaksa SIGKILL; periksa log/proses sebelum menjalankan ulang.
-
-Setelah update kode, jalankan ulang installer lalu `service restart`.
-
-## Tes
-
-```sh
-go test -race ./...
-go vet ./...
+# snowflake dengan bridge custom
+TORCTL_BRIDGES="snowflake 192.0.2.3:1 2 <FINGERPRINT>" ./torctl start
 ```
 
-Tes menggunakan upstream dan katalog dummy; tidak membutuhkan Tor atau inference
-live. Pengujian kompatibilitas langsung di Android/OpenCode tetap diperlukan.
+## Persyaratan
 
-## Uji respons setiap model gratis dengan curl
+* Linux (Termux/Android punya kok) — memakai `Pdeathsig`/`Setpgid`.
+* `tor` di `PATH` (Termux: `pkg install tor`).
+* `snowflake-client` di `PATH` (Termux: `pkg install snowflake-client`)
+  — atau set `TORCTL_SNOWFLAKE=0`.
 
-Setelah Tor dan bridge berjalan:
+## Catatan
 
-```sh
-pkg install curl jq
-bash scripts/test-free-models.sh
-```
-
-Script mengambil ID aktual dari `/v1/models`, melewati alias `ocr`, lalu mengirim
-request Messages non-streaming satu per satu. HTTP 200 dengan teks tidak kosong
-berarti `ok`; respons kosong, error, dan timeout dicatat terpisah. Tes ini tidak
-menguji streaming, tool use, atau akurasi jawaban. Karena memakai ID langsung,
-fallback ke model lain tidak menyembunyikan kegagalan model yang diuji.
-
-Output disimpan ke `~/opencode-model-tests/<timestamp>-<pid>/`: katalog, request,
-respons, stderr curl, dan `results.jsonl`. Exit code 1 berarti ada probe gagal;
-periksa error sebelum menyimpulkan model tidak tersedia (429/Tor/upstream bisa
-bersifat sementara). Semua model diuji berurutan dengan jeda 2 detik dan timeout
-90 detik per model agar tidak membanjiri upstream.
-
-Override opsional:
-
-```sh
-OCR_PROBE_TIMEOUT=180 OCR_PROBE_DELAY=5 bash scripts/test-free-models.sh
-```
-
-Jika alias diubah di config, set `OCR_ALIAS` dengan nilai yang sama. Jika port
-bridge diubah, gunakan `OCR_BASE_URL=http://127.0.0.1:PORT` (tanpa `/v1`).
+* `start` berjalan **foreground** (desain: satu sesi = satu supervisor).
+  `stop`/`status`/`logs` dari sesi lain bebas.
+* Bridge in-process: PID bridge = PID torctl (lihat `status`: baris
+  `bridge ... (in-process torctl)`). Kalau suatu saat butuh bridge sebagai
+  child terpisah, tinggal pindahkan goroutine accept ke `launch()`.
+* Urutan shutdown: **bridge → tor → snowflake → state** (sesuai desain).

@@ -1,4 +1,3 @@
-/ocr
+/torctl
 *.log
-.env
 .DS_Store
