@@ -67,3 +67,46 @@ node --test scripts/service.test.cjs
 ```
 
 Tes memakai child process dummy; tidak memerlukan Go, Termux, atau upstream.
+
+## Storage statistik JSON (tanpa SQLite)
+
+Statistik dashboard disimpan di
+`~/.local/state/opencode-router/usage.json`. Build tidak lagi membutuhkan
+`modernc.org/sqlite`, CGO, atau paket database tambahan. Modul YAML tetap perlu
+tersedia/download pada build pertama. Penyimpanan JSON ditujukan untuk satu
+instance router dan pemakaian pribadi, bukan riwayat besar jutaan request.
+
+- `usage.path` di config memilih lokasi file JSON. Environment `OCR_USAGE_PATH`
+  mengganti lokasi default; `OCR_USAGE_DB` lama tetap diterima sebagai fallback.
+  Config `usage.path` yang terisi mengalahkan environment.
+- File ditulis atomik dengan temporary file + fsync + rename, permission `0600`,
+  dan exclusive advisory lock. Dua instance tidak boleh menulis path yang sama.
+- Request masuk antrean nonblocking, disimpan maksimal setiap sekitar satu
+  detik saat disk normal, dan di-flush saat graceful shutdown. Force-kill/crash
+  dapat menghilangkan request yang belum tersimpan. Antrean penuh dapat
+  menjatuhkan statistik, tetapi tidak menghambat respons router.
+- `usage.retention_days` tetap berlaku (default 60 hari). Nilai `0` menyimpan
+  seluruh riwayat. Snapshot dimuat ke memori dan ditulis ulang saat berubah;
+  batasi retensi untuk menghemat memori/storage pada HP.
+- File SQLite lama **tidak dimigrasikan, dihapus, atau ditimpa**. Default baru
+  memakai `usage.json`, sehingga statistik mulai dari kosong. Bila config masih
+  menunjuk file SQLite lama, ubah `usage.path` ke path JSON baru atau kosongkan
+  agar memakai default. File rusak/format tidak didukung akan ditolak; router
+  mencatat error dan menonaktifkan statistik untuk sesi itu, bukan merusak file.
+
+Sesudah mengambil versi kode ini, build ulang dan restart:
+
+```sh
+cd ~/opencode-router
+unset OCR_CONFIG OCR_SERVICE_DIR OCR_BINARY
+bash scripts/install-termux-service.sh && service restart
+```
+
+Jangan jalankan launcher lama `start-router` bersama service baru. Jika launcher
+lama sedang berjalan, hentikan dulu memakai `stop-router`.
+
+Tes Go (termasuk persistensi JSON, retensi, lock, dan concurrency):
+
+```sh
+go test -race ./...
+```

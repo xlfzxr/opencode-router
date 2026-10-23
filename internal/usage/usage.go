@@ -1,19 +1,18 @@
-// Package usage stores per-request token and latency statistics for the local
-// dashboard. Writes are queued so a slow disk never delays an SSE stream, and
-// the SQLite file is optional: a disabled store degrades to a no-op.
+// Package usage stores dashboard statistics in an atomic JSON snapshot.
+// Records are queued so disk writes never delay an SSE stream.
 package usage
 
 import (
-	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
+	"syscall"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 const (
@@ -22,25 +21,6 @@ const (
 	maxProxyLen  = 200
 	defaultLimit = 50
 )
-
-const schema = `
-CREATE TABLE IF NOT EXISTS requests (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	ts INTEGER NOT NULL,
-	model TEXT NOT NULL DEFAULT '',
-	endpoint TEXT NOT NULL DEFAULT '',
-	status TEXT NOT NULL DEFAULT 'ok',
-	http_status INTEGER NOT NULL DEFAULT 0,
-	latency_ms INTEGER NOT NULL DEFAULT 0,
-	prompt_tokens INTEGER NOT NULL DEFAULT 0,
-	completion_tokens INTEGER NOT NULL DEFAULT 0,
-	stream INTEGER NOT NULL DEFAULT 0,
-	proxy TEXT NOT NULL DEFAULT '',
-	error TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
-CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model);
-`
 
 // Entry is one completed downstream request.
 type Entry struct {
@@ -57,20 +37,35 @@ type Entry struct {
 	Error            string
 }
 
-type Store struct {
-	db        *sql.DB
-	ch        chan Entry
-	wg        sync.WaitGroup
-	disabled  bool
-	dropOnce  sync.Once
-	closeOnce sync.Once
+type snapshot struct {
+	Version int           `json:"version"`
+	NextID  int64         `json:"nextId"`
+	Entries []RecentEntry `json:"entries"`
 }
 
-// Disabled returns a store that accepts records but keeps nothing.
-func Disabled() *Store { return &Store{disabled: true} }
+type Store struct {
+	mu            sync.RWMutex
+	data          snapshot
+	path          string
+	retentionDays int
+	dirty         bool
+	lock          *os.File
+	ch            chan Entry
+	wg            sync.WaitGroup
+	gate          sync.RWMutex // prevents Record racing with Close
+	closed        bool
+	dropOnce      sync.Once
+	closeOnce     sync.Once
+	closeErr      error
+}
 
-// DefaultPath is where usage data lives unless config overrides it.
+func Disabled() *Store { return &Store{} }
+
 func DefaultPath() string {
+	if p := os.Getenv("OCR_USAGE_PATH"); p != "" {
+		return p
+	}
+	// Legacy override is accepted, but SQLite content is never overwritten.
 	if p := os.Getenv("OCR_USAGE_DB"); p != "" {
 		return p
 	}
@@ -78,11 +73,12 @@ func DefaultPath() string {
 	if err != nil {
 		return ""
 	}
-	return filepath.Join(home, ".local", "state", "opencode-router", "usage.db")
+	return filepath.Join(home, ".local", "state", "opencode-router", "usage.json")
 }
 
-// Open creates the database (and its parent directory) if needed. With
-// enabled=false it returns a no-op store. retentionDays <= 0 keeps everything.
+// Open loads JSON and holds an advisory lock until Close. Corrupt or legacy
+// SQLite files are rejected without modifying them. Retention is applied on
+// startup and on each snapshot write; <=0 retains all history.
 func Open(path string, enabled bool, retentionDays int) (*Store, error) {
 	if !enabled {
 		return Disabled(), nil
@@ -93,32 +89,46 @@ func Open(path string, enabled bool, retentionDays int) (*Store, error) {
 	if path == "" {
 		return nil, fmt.Errorf("usage path unavailable")
 	}
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return nil, fmt.Errorf("create usage dir: %w", err)
-		}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, err
 	}
-	db, err := sql.Open("sqlite", path)
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-
-	var mode string
-	_ = db.QueryRow("PRAGMA journal_mode=WAL").Scan(&mode)
-	_, _ = db.Exec("PRAGMA busy_timeout=5000")
-	_, _ = db.Exec("PRAGMA synchronous=NORMAL")
-	if _, err := db.Exec(schema); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("init usage schema: %w", err)
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lock.Close()
+		return nil, fmt.Errorf("usage file already locked: %w", err)
 	}
-	if retentionDays > 0 {
-		cutoff := time.Now().AddDate(0, 0, -retentionDays).UnixMilli()
-		_, _ = db.Exec(`DELETE FROM requests WHERE ts < ?`, cutoff)
+	s := &Store{path: path, lock: lock, retentionDays: retentionDays, data: snapshot{Version: 1, NextID: 1, Entries: []RecentEntry{}}}
+	fail := func(err error) (*Store, error) {
+		syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		lock.Close()
+		return nil, err
 	}
-
-	s := &Store{db: db, ch: make(chan Entry, 256)}
+	raw, err := os.ReadFile(path)
+	if err == nil {
+		if err := json.Unmarshal(raw, &s.data); err != nil {
+			return fail(fmt.Errorf("usage file is not valid JSON (SQLite is not migrated automatically); choose a new usage.path: %w", err))
+		}
+		if s.data.Version != 1 || s.data.NextID < 1 {
+			return fail(fmt.Errorf("invalid or unsupported usage snapshot"))
+		}
+		var last int64
+		for _, e := range s.data.Entries {
+			if e.ID <= last || e.ID >= s.data.NextID {
+				return fail(fmt.Errorf("invalid usage entry IDs"))
+			}
+			last = e.ID
+		}
+	} else if !os.IsNotExist(err) {
+		return fail(err)
+	}
+	s.dirty = true
+	if err := s.persist(); err != nil {
+		return fail(err)
+	}
+	s.ch = make(chan Entry, 256)
 	s.wg.Add(1)
 	go s.writer()
 	return s, nil
@@ -126,22 +136,33 @@ func Open(path string, enabled bool, retentionDays int) (*Store, error) {
 
 func (s *Store) writer() {
 	defer s.wg.Done()
-	for entry := range s.ch {
-		s.insert(entry)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case entry, ok := <-s.ch:
+			if !ok {
+				s.closeErr = s.persist()
+				return
+			}
+			s.insert(entry)
+		case <-ticker.C:
+			if err := s.persist(); err != nil {
+				log.Printf("[usage] save: %v", err)
+			}
+		}
 	}
 }
 
-// Record queues a request. It never blocks the caller; records are dropped only
-// if the writer cannot keep up.
+// Record is nonblocking; a full queue drops records rather than blocking SSE.
 func (s *Store) Record(entry Entry) {
-	if s == nil || s.db == nil {
+	if s == nil {
 		return
 	}
-	if entry.Time.IsZero() {
-		entry.Time = time.Now()
-	}
-	if entry.Status == "" {
-		entry.Status = "ok"
+	s.gate.RLock()
+	defer s.gate.RUnlock()
+	if s.ch == nil || s.closed {
+		return
 	}
 	select {
 	case s.ch <- entry:
@@ -150,39 +171,87 @@ func (s *Store) Record(entry Entry) {
 	}
 }
 
-func (s *Store) insert(entry Entry) {
-	_, err := s.db.Exec(`INSERT INTO requests
-		(ts, model, endpoint, status, http_status, latency_ms, prompt_tokens, completion_tokens, stream, proxy, error)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		entry.Time.UnixMilli(),
-		truncate(entry.Model, maxModelLen),
-		entry.Endpoint,
-		entry.Status,
-		entry.HTTPStatus,
-		entry.LatencyMs,
-		entry.PromptTokens,
-		entry.CompletionTokens,
-		boolInt(entry.Stream),
-		truncate(entry.Proxy, maxProxyLen),
-		truncate(entry.Error, maxErrorLen),
-	)
-	if err != nil {
-		log.Printf("[usage] insert: %v", err)
+func (s *Store) insert(e Entry) {
+	if e.Time.IsZero() {
+		e.Time = time.Now()
 	}
+	if e.Status == "" {
+		e.Status = "ok"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.Entries = append(s.data.Entries, RecentEntry{
+		ID: s.data.NextID, Time: e.Time, Model: truncate(e.Model, maxModelLen),
+		Endpoint: e.Endpoint, Status: e.Status, HTTPStatus: e.HTTPStatus, LatencyMs: e.LatencyMs,
+		PromptTokens: e.PromptTokens, CompletionTokens: e.CompletionTokens,
+		TotalTokens: e.PromptTokens + e.CompletionTokens, Stream: e.Stream,
+		Proxy: truncate(e.Proxy, maxProxyLen), Error: truncate(e.Error, maxErrorLen),
+	})
+	s.data.NextID++
+	s.dirty = true
 }
 
-// Close drains pending writes and closes the database. Safe to call once.
-func (s *Store) Close() error {
-	if s == nil || s.db == nil {
+// persist writes a private temp file, fsyncs it, then atomically replaces the
+// snapshot. A failed write leaves the old snapshot intact and is retried.
+func (s *Store) persist() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.retentionDays > 0 {
+		cutoff := time.Now().AddDate(0, 0, -s.retentionDays)
+		kept := make([]RecentEntry, 0, len(s.data.Entries))
+		for _, e := range s.data.Entries {
+			if !e.Time.Before(cutoff) {
+				kept = append(kept, e)
+			}
+		}
+		if len(kept) != len(s.data.Entries) {
+			s.data.Entries = kept
+			s.dirty = true
+		}
+	}
+	if !s.dirty {
 		return nil
 	}
-	var err error
+	f, err := os.CreateTemp(filepath.Dir(s.path), ".usage-*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if err = json.NewEncoder(f).Encode(s.data); err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if err := os.Rename(f.Name(), s.path); err != nil {
+		return err
+	}
+	s.dirty = false
+	return nil
+}
+
+// Close drains the queue and flushes the snapshot. Safe alongside Record and
+// safe to call more than once. The lock file stays in place (flock is released).
+func (s *Store) Close() error {
+	if s == nil || s.ch == nil {
+		return nil
+	}
 	s.closeOnce.Do(func() {
+		s.gate.Lock()
+		s.closed = true
 		close(s.ch)
+		s.gate.Unlock()
 		s.wg.Wait()
-		err = s.db.Close()
+		syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
+		if err := s.lock.Close(); s.closeErr == nil {
+			s.closeErr = err
+		}
 	})
-	return err
+	return s.closeErr
 }
 
 type Totals struct {
@@ -240,138 +309,111 @@ type Stats struct {
 	Recent  []RecentEntry `json:"recent"`
 }
 
-// Stats aggregates one period. period is one of today, 24h, 7d, 30d, 60d, all.
+// Stats preserves the dashboard response format of the former SQLite backend.
 func (s *Store) Stats(period string, now time.Time) (Stats, error) {
 	start, bucket, err := periodStart(period, now)
 	if err != nil {
 		return Stats{}, err
 	}
-	out := Stats{Period: period, Bucket: bucket, Since: start}
-	if s == nil || s.db == nil {
-		out.ByModel = []ModelStats{}
-		out.Series = []SeriesPoint{}
-		out.Recent = []RecentEntry{}
+	out := Stats{Period: period, Bucket: bucket, Since: start, ByModel: []ModelStats{}, Series: []SeriesPoint{}, Recent: []RecentEntry{}}
+	if s == nil {
 		return out, nil
 	}
-
-	row := s.db.QueryRow(`SELECT
-		COUNT(*),
-		COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(prompt_tokens), 0),
-		COALESCE(SUM(completion_tokens), 0),
-		COALESCE(AVG(latency_ms), 0)
-		FROM requests WHERE ts >= ?`, start.UnixMilli())
-	var avg float64
-	if err := row.Scan(&out.Totals.Requests, &out.Totals.OK, &out.Totals.Errors, &out.Totals.Streams,
-		&out.Totals.PromptTokens, &out.Totals.CompletionTokens, &avg); err != nil {
-		return Stats{}, err
+	s.mu.RLock()
+	entries := append([]RecentEntry(nil), s.data.Entries...)
+	s.mu.RUnlock()
+	models := map[string]*ModelStats{}
+	latency := map[string]int64{}
+	var totalLatency int64
+	for _, e := range entries {
+		if e.Time.Before(start) {
+			continue
+		}
+		t := &out.Totals
+		t.Requests++
+		if e.Status == "ok" {
+			t.OK++
+		} else {
+			t.Errors++
+		}
+		if e.Stream {
+			t.Streams++
+		}
+		t.PromptTokens += e.PromptTokens
+		t.CompletionTokens += e.CompletionTokens
+		totalLatency += e.LatencyMs
+		m := models[e.Model]
+		if m == nil {
+			m = &ModelStats{Model: e.Model}
+			models[e.Model] = m
+		}
+		m.Requests++
+		if e.Status == "ok" {
+			m.OK++
+		} else {
+			m.Errors++
+		}
+		m.PromptTokens += e.PromptTokens
+		m.CompletionTokens += e.CompletionTokens
+		latency[e.Model] += e.LatencyMs
 	}
 	out.Totals.TotalTokens = out.Totals.PromptTokens + out.Totals.CompletionTokens
-	out.Totals.AvgLatencyMs = round1(avg)
-
-	rows, err := s.db.Query(`SELECT model, COUNT(*),
-		COALESCE(SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(prompt_tokens), 0),
-		COALESCE(SUM(completion_tokens), 0),
-		COALESCE(AVG(latency_ms), 0)
-		FROM requests WHERE ts >= ?
-		GROUP BY model
-		ORDER BY SUM(prompt_tokens + completion_tokens) DESC, COUNT(*) DESC
-		LIMIT 50`, start.UnixMilli())
-	if err != nil {
-		return Stats{}, err
+	if out.Totals.Requests > 0 {
+		out.Totals.AvgLatencyMs = round1(float64(totalLatency) / float64(out.Totals.Requests))
 	}
-	out.ByModel = []ModelStats{}
-	for rows.Next() {
-		var m ModelStats
-		if err := rows.Scan(&m.Model, &m.Requests, &m.OK, &m.PromptTokens, &m.CompletionTokens, &avg); err != nil {
-			rows.Close()
-			return Stats{}, err
-		}
-		m.Errors = m.Requests - m.OK
+	for _, m := range models {
 		m.TotalTokens = m.PromptTokens + m.CompletionTokens
-		m.AvgLatencyMs = round1(avg)
-		out.ByModel = append(out.ByModel, m)
+		m.AvgLatencyMs = round1(float64(latency[m.Model]) / float64(m.Requests))
+		out.ByModel = append(out.ByModel, *m)
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return Stats{}, err
+	sort.Slice(out.ByModel, func(i, j int) bool {
+		a, b := out.ByModel[i], out.ByModel[j]
+		if a.TotalTokens != b.TotalTokens {
+			return a.TotalTokens > b.TotalTokens
+		}
+		if a.Requests != b.Requests {
+			return a.Requests > b.Requests
+		}
+		return a.Model < b.Model
+	})
+	if len(out.ByModel) > 50 {
+		out.ByModel = out.ByModel[:50]
 	}
-	rows.Close()
-
-	// "all" would otherwise start in 1970 and produce an unbounded series.
-	if period == "all" {
-		var minTS sql.NullInt64
-		if err := s.db.QueryRow(`SELECT MIN(ts) FROM requests`).Scan(&minTS); err == nil && minTS.Valid {
-			start = time.UnixMilli(minTS.Int64)
+	if period == "all" && len(entries) > 0 {
+		start = entries[0].Time.In(now.Location())
+		for _, e := range entries {
+			if e.Time.Before(start) {
+				start = e.Time.In(now.Location())
+			}
 		}
 		if now.Sub(start) > 400*24*time.Hour {
 			start = now.AddDate(0, 0, -400)
 		}
 	}
-
-	layout := "%Y-%m-%d"
-	if bucket == "hour" {
-		layout = "%Y-%m-%d %H:00"
-	}
-	seriesQuery := fmt.Sprintf(`SELECT strftime('%s', ts / 1000, 'unixepoch', 'localtime') AS label,
-		COUNT(*),
-		COALESCE(SUM(prompt_tokens), 0),
-		COALESCE(SUM(completion_tokens), 0)
-		FROM requests WHERE ts >= ?
-		GROUP BY label ORDER BY label`, layout)
-	rows, err = s.db.Query(seriesQuery, start.UnixMilli())
-	if err != nil {
-		return Stats{}, err
-	}
 	points := map[string]SeriesPoint{}
-	for rows.Next() {
-		var p SeriesPoint
-		if err := rows.Scan(&p.Label, &p.Requests, &p.PromptTokens, &p.CompletionTokens); err != nil {
-			rows.Close()
-			return Stats{}, err
+	layout := "2006-01-02"
+	if bucket == "hour" {
+		layout = "2006-01-02 15:00"
+	}
+	for _, e := range entries {
+		if e.Time.Before(start) {
+			continue
 		}
-		points[p.Label] = p
+		label := e.Time.In(now.Location()).Format(layout)
+		p := points[label]
+		p.Label = label
+		p.Requests++
+		p.PromptTokens += e.PromptTokens
+		p.CompletionTokens += e.CompletionTokens
+		points[label] = p
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return Stats{}, err
-	}
-	rows.Close()
 	if out.Totals.Requests > 0 {
 		out.Series = fillSeries(points, start, now, bucket)
-	} else {
-		out.Series = []SeriesPoint{}
 	}
-
-	out.Recent = []RecentEntry{}
-	rows, err = s.db.Query(`SELECT id, ts, model, endpoint, status, http_status, latency_ms,
-		prompt_tokens, completion_tokens, stream, proxy, error
-		FROM requests ORDER BY id DESC LIMIT ?`, defaultLimit)
-	if err != nil {
-		return Stats{}, err
+	// Recent requests intentionally span all periods, matching the original API.
+	for i := len(entries) - 1; i >= 0 && len(out.Recent) < defaultLimit; i-- {
+		out.Recent = append(out.Recent, entries[i])
 	}
-	for rows.Next() {
-		var e RecentEntry
-		var stream int
-		var ts int64
-		if err := rows.Scan(&e.ID, &ts, &e.Model, &e.Endpoint, &e.Status, &e.HTTPStatus, &e.LatencyMs,
-			&e.PromptTokens, &e.CompletionTokens, &stream, &e.Proxy, &e.Error); err != nil {
-			rows.Close()
-			return Stats{}, err
-		}
-		e.Time = time.UnixMilli(ts)
-		e.Stream = stream != 0
-		e.TotalTokens = e.PromptTokens + e.CompletionTokens
-		out.Recent = append(out.Recent, e)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return Stats{}, err
-	}
-	rows.Close()
 	out.Since = start
 	return out, nil
 }
@@ -422,13 +464,6 @@ func fillSeries(points map[string]SeriesPoint, start, now time.Time, bucket stri
 }
 
 func round1(v float64) float64 { return math.Round(v*10) / 10 }
-
-func boolInt(v bool) int {
-	if v {
-		return 1
-	}
-	return 0
-}
 
 func truncate(s string, n int) string {
 	if len(s) <= n {

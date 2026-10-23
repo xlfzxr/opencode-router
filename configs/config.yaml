@@ -17,7 +17,7 @@ session:
 # Local usage statistics and dashboard (http://127.0.0.1:3002/dashboard).
 usage:
   enabled: true
-  path: ""            # default: ~/.local/state/opencode-router/usage.db
+  path: ""            # default: ~/.local/state/opencode-router/usage.json
   retention_days: 60  # 0 keeps all history
 
 # Public single-model alias backed by 9router-style smart routing: clients
