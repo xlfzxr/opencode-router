@@ -14,7 +14,8 @@ if [[ -e "$DEST" ]] && ! grep -q '# opencode-router-service' "$DEST"; then
 fi
 
 cd "$ROOT"
-echo 'Build opencode-router...'
+echo 'Build opencode-router (storage JSON, tanpa SQLite)...'
+echo 'Build pertama tetap mengunduh modul YAML. Tunggu sampai selesai.'
 # Build to a temporary file so an existing running binary is not overwritten.
 TMP="$(mktemp "$ROOT/.ocr-build.XXXXXX")"
 trap 'rm -f "$TMP"' EXIT
